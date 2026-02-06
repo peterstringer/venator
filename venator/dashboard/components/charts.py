@@ -231,3 +231,153 @@ def detector_comparison_chart(
         xaxis=dict(range=[0, 1.05]),
     )
     return fig
+
+
+def score_gauge(
+    score: float,
+    threshold: float,
+    title: str = "Anomaly Score",
+) -> go.Figure:
+    """Gauge/meter showing a score relative to the decision threshold.
+
+    Args:
+        score: The ensemble anomaly score.
+        threshold: Decision threshold for anomaly classification.
+        title: Gauge title.
+
+    Returns:
+        Plotly Figure with a gauge indicator.
+    """
+    axis_max = max(1.0, score * 1.2)
+
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=score,
+            number=dict(valueformat=".4f"),
+            title=dict(text=title),
+            gauge=dict(
+                axis=dict(range=[0, axis_max]),
+                bar=dict(color="rgba(55, 128, 191, 0.8)"),
+                steps=[
+                    dict(range=[0, threshold * 0.7], color="rgba(44, 160, 101, 0.2)"),
+                    dict(range=[threshold * 0.7, threshold], color="rgba(255, 193, 7, 0.2)"),
+                    dict(range=[threshold, axis_max], color="rgba(219, 64, 82, 0.2)"),
+                ],
+                threshold=dict(
+                    line=dict(color="black", width=4),
+                    thickness=0.75,
+                    value=threshold,
+                ),
+            ),
+        )
+    )
+    fig.update_layout(
+        height=250,
+        margin=dict(t=60, b=20, l=30, r=30),
+    )
+    return fig
+
+
+def ablation_line_chart(
+    x_values: list[int | float],
+    y_values: list[float],
+    x_label: str,
+    y_label: str,
+    title: str = "",
+    highlight_best: bool = True,
+) -> go.Figure:
+    """Line chart for ablation results with optional best-point highlight.
+
+    Args:
+        x_values: X-axis values (e.g., layer indices or PCA dimensions).
+        y_values: Y-axis metric values (e.g., AUROC).
+        x_label: X-axis label.
+        y_label: Y-axis label.
+        title: Optional chart title.
+        highlight_best: Whether to highlight the point with the best y-value.
+
+    Returns:
+        Plotly Figure with a line chart.
+    """
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="lines+markers",
+            name=y_label,
+            line=dict(color="rgba(55, 128, 191, 1)"),
+            marker=dict(size=8),
+        )
+    )
+
+    if highlight_best and y_values:
+        best_idx = int(np.argmax(y_values))
+        best_x = x_values[best_idx]
+        best_y = y_values[best_idx]
+        fig.add_trace(
+            go.Scatter(
+                x=[best_x],
+                y=[best_y],
+                mode="markers",
+                name=f"Best: {best_y:.4f}",
+                marker=dict(size=14, color="rgba(219, 64, 82, 1)", symbol="star"),
+            )
+        )
+        fig.add_hline(
+            y=best_y,
+            line_dash="dash",
+            line_color="lightgray",
+            annotation_text=f"{best_y:.4f}",
+            annotation_position="top right",
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+    )
+    return fig
+
+
+def correlation_heatmap(
+    scores: dict[str, np.ndarray],
+    title: str = "Score Correlation Heatmap",
+) -> go.Figure:
+    """Heatmap of pairwise correlation between detector scores.
+
+    Args:
+        scores: Mapping of detector name to score arrays (all same length).
+        title: Chart title.
+
+    Returns:
+        Plotly Figure with a correlation heatmap.
+    """
+    names = list(scores.keys())
+    arrays = np.array([scores[n] for n in names])
+    corr = np.corrcoef(arrays)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=corr,
+            x=names,
+            y=names,
+            colorscale="RdBu_r",
+            zmin=-1,
+            zmax=1,
+            texttemplate="%{z:.2f}",
+            textfont=dict(size=12),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+        yaxis=dict(scaleanchor="x"),
+    )
+    return fig
