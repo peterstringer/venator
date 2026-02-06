@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "venator"
+version = "0.1.0"
+description = "Jailbreak detection via unsupervised anomaly detection on LLM hidden state activations"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "mlx>=0.21.0",
+    "mlx-lm>=0.20.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+    "scikit-learn>=1.4.0",
+    "h5py>=3.10.0",
+    "torch>=2.1.0",
+    "datasets>=2.16.0",
+    "tqdm>=4.66.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+dashboard = [
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["venator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
