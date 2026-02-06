@@ -223,47 +223,51 @@ def collect_benign_prompts(n: int = 500, seed: int = 42) -> list[tuple[str, str]
     per_source = n // 3  # Split roughly equally across 3 sources
     collected: list[tuple[str, str]] = []
 
-    # --- Source 1: Alpaca ---
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset  # type: ignore[import-untyped]
+    except ImportError:
+        load_dataset = None  # type: ignore[assignment]
+        logger.warning("'datasets' package not installed — using built-in prompts only")
 
-        logger.info("Loading Alpaca dataset...")
-        ds = load_dataset("tatsu-lab/alpaca", split="train", trust_remote_code=True)
-        alpaca_prompts: list[str] = []
-        for row in ds:
-            instruction = row.get("instruction", "").strip()
-            inp = row.get("input", "").strip()
-            if instruction:
-                prompt = f"{instruction}\n{inp}" if inp else instruction
-                alpaca_prompts.append(prompt)
+    # --- Source 1: Alpaca ---
+    if load_dataset is not None:
+        try:
+            logger.info("Loading Alpaca dataset...")
+            ds = load_dataset("tatsu-lab/alpaca", split="train", trust_remote_code=True)
+            alpaca_prompts: list[str] = []
+            for row in ds:
+                instruction = row.get("instruction", "").strip()
+                inp = row.get("input", "").strip()
+                if instruction:
+                    prompt = f"{instruction}\n{inp}" if inp else instruction
+                    alpaca_prompts.append(prompt)
 
-        sampled = rng.sample(alpaca_prompts, min(per_source, len(alpaca_prompts)))
-        collected.extend((p, "alpaca") for p in sampled)
-        logger.info("Collected %d prompts from Alpaca", len(sampled))
-    except Exception as e:
-        logger.warning("Failed to load Alpaca dataset: %s", e)
+            sampled = rng.sample(alpaca_prompts, min(per_source, len(alpaca_prompts)))
+            collected.extend((p, "alpaca") for p in sampled)
+            logger.info("Collected %d prompts from Alpaca", len(sampled))
+        except Exception as e:
+            logger.warning("Failed to load Alpaca dataset: %s", e)
 
     # --- Source 2: MMLU ---
-    try:
-        from datasets import load_dataset
+    if load_dataset is not None:
+        try:
+            logger.info("Loading MMLU dataset...")
+            ds = load_dataset("cais/mmlu", "all", split="test", trust_remote_code=True)
+            mmlu_prompts: list[str] = []
+            for row in ds:
+                question = row.get("question", "").strip()
+                choices = row.get("choices", [])
+                if question and choices:
+                    options = "\n".join(
+                        f"{chr(65 + i)}) {c}" for i, c in enumerate(choices)
+                    )
+                    mmlu_prompts.append(f"{question}\n{options}")
 
-        logger.info("Loading MMLU dataset...")
-        ds = load_dataset("cais/mmlu", "all", split="test", trust_remote_code=True)
-        mmlu_prompts: list[str] = []
-        for row in ds:
-            question = row.get("question", "").strip()
-            choices = row.get("choices", [])
-            if question and choices:
-                options = "\n".join(
-                    f"{chr(65 + i)}) {c}" for i, c in enumerate(choices)
-                )
-                mmlu_prompts.append(f"{question}\n{options}")
-
-        sampled = rng.sample(mmlu_prompts, min(per_source, len(mmlu_prompts)))
-        collected.extend((p, "mmlu") for p in sampled)
-        logger.info("Collected %d prompts from MMLU", len(sampled))
-    except Exception as e:
-        logger.warning("Failed to load MMLU dataset: %s", e)
+            sampled = rng.sample(mmlu_prompts, min(per_source, len(mmlu_prompts)))
+            collected.extend((p, "mmlu") for p in sampled)
+            logger.info("Collected %d prompts from MMLU", len(sampled))
+        except Exception as e:
+            logger.warning("Failed to load MMLU dataset: %s", e)
 
     # --- Source 3: Diverse hand-crafted prompts ---
     diverse = _get_diverse_prompts()
@@ -304,37 +308,41 @@ def collect_jailbreak_prompts(n: int = 200, seed: int = 42) -> list[tuple[str, s
     rng = random.Random(seed)
     collected: list[tuple[str, str]] = []
 
-    # --- Source 1: JailbreakBench ---
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset  # type: ignore[import-untyped]
+    except ImportError:
+        load_dataset = None  # type: ignore[assignment]
+        logger.warning("'datasets' package not installed — using built-in prompts only")
 
-        logger.info("Loading JailbreakBench dataset...")
-        ds = load_dataset(
-            "JailbreakBench/JBB-Behaviors", "behaviors",
-            split="harmful", trust_remote_code=True,
-        )
-        for row in ds:
-            goal = row.get("Goal", "").strip()
-            if goal:
-                collected.append((goal, "jailbreakbench"))
-        logger.info("Collected %d prompts from JailbreakBench", len(collected))
-    except Exception as e:
-        logger.warning("Failed to load JailbreakBench dataset: %s", e)
+    # --- Source 1: JailbreakBench ---
+    if load_dataset is not None:
+        try:
+            logger.info("Loading JailbreakBench dataset...")
+            ds = load_dataset(
+                "JailbreakBench/JBB-Behaviors", "behaviors",
+                split="harmful", trust_remote_code=True,
+            )
+            for row in ds:
+                goal = row.get("Goal", "").strip()
+                if goal:
+                    collected.append((goal, "jailbreakbench"))
+            logger.info("Collected %d prompts from JailbreakBench", len(collected))
+        except Exception as e:
+            logger.warning("Failed to load JailbreakBench dataset: %s", e)
 
     # --- Source 2: AdvBench ---
-    try:
-        from datasets import load_dataset
-
-        n_before = len(collected)
-        logger.info("Loading AdvBench dataset...")
-        ds = load_dataset("walledai/AdvBench", split="train", trust_remote_code=True)
-        for row in ds:
-            prompt = row.get("prompt", "").strip()
-            if prompt:
-                collected.append((prompt, "advbench"))
-        logger.info("Collected %d prompts from AdvBench", len(collected) - n_before)
-    except Exception as e:
-        logger.warning("Failed to load AdvBench dataset: %s", e)
+    if load_dataset is not None:
+        try:
+            n_before = len(collected)
+            logger.info("Loading AdvBench dataset...")
+            ds = load_dataset("walledai/AdvBench", split="train", trust_remote_code=True)
+            for row in ds:
+                prompt = row.get("prompt", "").strip()
+                if prompt:
+                    collected.append((prompt, "advbench"))
+            logger.info("Collected %d prompts from AdvBench", len(collected) - n_before)
+        except Exception as e:
+            logger.warning("Failed to load AdvBench dataset: %s", e)
 
     # --- Source 3: Dan-style jailbreaks ---
     dan_prompts = _get_dan_style_jailbreaks()
