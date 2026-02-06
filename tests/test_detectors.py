@@ -1,8 +1,8 @@
 """Tests for anomaly detectors on synthetic Gaussian data.
 
-Tests the AnomalyDetector base class contract and the PCAMahalanobisDetector
-on controlled synthetic distributions where we know what "normal" and
-"anomalous" look like.
+Tests the AnomalyDetector base class contract, PCAMahalanobisDetector,
+IsolationForestDetector, and AutoencoderDetector on controlled synthetic
+distributions where we know what "normal" and "anomalous" look like.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from venator.detection.autoencoder import AutoencoderDetector
 from venator.detection.base import AnomalyDetector
+from venator.detection.isolation_forest import IsolationForestDetector
 from venator.detection.pca_mahalanobis import PCAMahalanobisDetector
 
 SEED = 42
@@ -483,3 +485,420 @@ class TestReproducibility:
         s2 = d2.score(X_test)
 
         np.testing.assert_array_almost_equal(s1, s2)
+
+
+# ===========================================================================
+# IsolationForestDetector
+# ===========================================================================
+
+
+class TestIsolationForestSubclass:
+    def test_is_anomaly_detector(self):
+        assert issubclass(IsolationForestDetector, AnomalyDetector)
+
+
+class TestIsolationForestSeparation:
+    """Core contract: outliers must score higher than in-distribution points."""
+
+    def test_outliers_score_higher(self, gaussian_data):
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=100)
+        detector.fit(X_train)
+
+        normal_scores = detector.score(X_normal_test)
+        outlier_scores = detector.score(X_outlier)
+
+        assert outlier_scores.mean() > normal_scores.mean()
+
+    def test_higher_is_more_anomalous(self, gaussian_data):
+        """Verify the convention: higher score = more anomalous."""
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=100)
+        detector.fit(X_train)
+
+        normal_scores = detector.score(X_normal_test)
+        outlier_scores = detector.score(X_outlier)
+
+        # Median outlier score should exceed the 90th percentile of normal scores
+        assert np.median(outlier_scores) > np.percentile(normal_scores, 90)
+
+    def test_score_single_matches_batch(self, gaussian_data):
+        X_train, X_normal_test, _ = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=100)
+        detector.fit(X_train)
+
+        batch_scores = detector.score(X_normal_test)
+        for i in range(5):
+            single = detector.score_single(X_normal_test[i])
+            np.testing.assert_almost_equal(single, batch_scores[i], decimal=5)
+
+    def test_fit_returns_self(self, gaussian_data):
+        X_train, _, _ = gaussian_data
+        detector = IsolationForestDetector(n_components=10)
+        result = detector.fit(X_train)
+        assert result is detector
+
+
+class TestIsolationForestStability:
+    def test_no_nan_in_scores(self, gaussian_data):
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=50)
+        detector.fit(X_train)
+
+        assert not np.any(np.isnan(detector.score(X_normal_test)))
+        assert not np.any(np.isnan(detector.score(X_outlier)))
+
+    def test_no_inf_in_scores(self, gaussian_data):
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=50)
+        detector.fit(X_train)
+
+        assert not np.any(np.isinf(detector.score(X_normal_test)))
+        assert not np.any(np.isinf(detector.score(X_outlier)))
+
+    def test_small_dataset(self):
+        """Fit on very small dataset (n < 50)."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((10, 8)).astype(np.float32)
+        X_outlier = rng.standard_normal((5, 8)).astype(np.float32) + 5.0
+
+        detector = IsolationForestDetector(n_components=5, n_estimators=50)
+        detector.fit(X_train)
+
+        normal_scores = detector.score(X_train)
+        outlier_scores = detector.score(X_outlier)
+
+        assert not np.any(np.isnan(normal_scores))
+        assert not np.any(np.isnan(outlier_scores))
+
+
+class TestIsolationForestPersistence:
+    def test_save_load_roundtrip(self, tmp_path, gaussian_data):
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(
+            n_components=10, n_estimators=50, random_state=42
+        )
+        detector.fit(X_train)
+
+        original_scores = detector.score(X_normal_test)
+
+        model_dir = tmp_path / "iforest"
+        detector.save(model_dir)
+        loaded = IsolationForestDetector.load(model_dir)
+
+        loaded_scores = loaded.score(X_normal_test)
+        np.testing.assert_array_almost_equal(loaded_scores, original_scores)
+
+    def test_save_preserves_config(self, tmp_path, gaussian_data):
+        X_train, _, _ = gaussian_data
+
+        detector = IsolationForestDetector(
+            n_components=8, n_estimators=77, contamination=0.05, random_state=99
+        )
+        detector.fit(X_train)
+        detector.save(tmp_path / "model")
+
+        loaded = IsolationForestDetector.load(tmp_path / "model")
+        assert loaded.n_components == 8
+        assert loaded.n_estimators == 77
+        assert loaded.contamination == pytest.approx(0.05)
+        assert loaded.random_state == 99
+
+    def test_loaded_still_separates(self, tmp_path, gaussian_data):
+        X_train, X_normal_test, X_outlier = gaussian_data
+
+        detector = IsolationForestDetector(n_components=10, n_estimators=100)
+        detector.fit(X_train)
+        detector.save(tmp_path / "model")
+
+        loaded = IsolationForestDetector.load(tmp_path / "model")
+        normal_scores = loaded.score(X_normal_test)
+        outlier_scores = loaded.score(X_outlier)
+
+        assert outlier_scores.mean() > normal_scores.mean()
+
+
+class TestIsolationForestValidation:
+    def test_score_before_fit_raises(self):
+        detector = IsolationForestDetector(n_components=10)
+        X = np.random.default_rng(SEED).standard_normal((5, 10)).astype(np.float32)
+
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            detector.score(X)
+
+    def test_fit_1d_raises(self):
+        detector = IsolationForestDetector(n_components=5)
+        with pytest.raises(ValueError, match="2D"):
+            detector.fit(np.array([1.0, 2.0, 3.0]))
+
+    def test_fit_single_sample_raises(self):
+        detector = IsolationForestDetector(n_components=5)
+        with pytest.raises(ValueError, match="at least 2"):
+            detector.fit(np.array([[1.0, 2.0, 3.0]]))
+
+    def test_negative_components_raises(self):
+        with pytest.raises(ValueError, match="n_components"):
+            IsolationForestDetector(n_components=0)
+
+    def test_negative_estimators_raises(self):
+        with pytest.raises(ValueError, match="n_estimators"):
+            IsolationForestDetector(n_estimators=0)
+
+
+# ===========================================================================
+# AutoencoderDetector
+# ===========================================================================
+
+
+class TestAutoencoderSubclass:
+    def test_is_anomaly_detector(self):
+        assert issubclass(AutoencoderDetector, AnomalyDetector)
+
+
+class TestAutoencoderSeparation:
+    """Core contract: outliers should have higher reconstruction error."""
+
+    def test_outliers_score_higher(self):
+        """Use larger shift and more training to get reliable separation."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((200, 20)).astype(np.float32)
+        X_normal = rng.standard_normal((50, 20)).astype(np.float32)
+        X_outlier = rng.standard_normal((50, 20)).astype(np.float32) + 8.0
+
+        detector = AutoencoderDetector(
+            n_components=10,
+            hidden_dim=32,
+            latent_dim=8,
+            epochs=100,
+            batch_size=32,
+            learning_rate=1e-3,
+            early_stopping_patience=15,
+        )
+        detector.fit(X_train)
+
+        normal_scores = detector.score(X_normal)
+        outlier_scores = detector.score(X_outlier)
+
+        assert outlier_scores.mean() > normal_scores.mean()
+
+    def test_higher_is_more_anomalous(self):
+        """Reconstruction error is the anomaly score: higher = more anomalous."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((200, 20)).astype(np.float32)
+        X_outlier = rng.standard_normal((30, 20)).astype(np.float32) + 10.0
+
+        detector = AutoencoderDetector(
+            n_components=10, hidden_dim=32, latent_dim=8, epochs=100
+        )
+        detector.fit(X_train)
+
+        train_scores = detector.score(X_train)
+        outlier_scores = detector.score(X_outlier)
+
+        # Training data should reconstruct well → low scores
+        assert train_scores.mean() < outlier_scores.mean()
+
+    def test_score_single_matches_batch(self):
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 15)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=8, hidden_dim=16, latent_dim=4, epochs=50
+        )
+        detector.fit(X_train)
+
+        batch_scores = detector.score(X_train[:5])
+        for i in range(5):
+            single = detector.score_single(X_train[i])
+            np.testing.assert_almost_equal(single, batch_scores[i], decimal=5)
+
+    def test_fit_returns_self(self):
+        rng = np.random.default_rng(SEED)
+        X = rng.standard_normal((50, 10)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=5, hidden_dim=16, latent_dim=4, epochs=10
+        )
+        result = detector.fit(X)
+        assert result is detector
+
+
+class TestAutoencoderStability:
+    def test_no_nan_in_scores(self):
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 15)).astype(np.float32)
+        X_outlier = rng.standard_normal((20, 15)).astype(np.float32) + 5.0
+
+        detector = AutoencoderDetector(
+            n_components=8, hidden_dim=16, latent_dim=4, epochs=50
+        )
+        detector.fit(X_train)
+
+        assert not np.any(np.isnan(detector.score(X_train)))
+        assert not np.any(np.isnan(detector.score(X_outlier)))
+
+    def test_no_inf_in_scores(self):
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 15)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=8, hidden_dim=16, latent_dim=4, epochs=50
+        )
+        detector.fit(X_train)
+
+        assert not np.any(np.isinf(detector.score(X_train)))
+
+    def test_scores_are_non_negative(self):
+        """MSE is always >= 0."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 15)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=8, hidden_dim=16, latent_dim=4, epochs=50
+        )
+        detector.fit(X_train)
+
+        assert np.all(detector.score(X_train) >= 0)
+
+    def test_small_dataset(self):
+        """Fit on very small dataset (n < 50)."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((10, 8)).astype(np.float32)
+        X_outlier = rng.standard_normal((5, 8)).astype(np.float32) + 5.0
+
+        detector = AutoencoderDetector(
+            n_components=4, hidden_dim=8, latent_dim=2, epochs=30, batch_size=4
+        )
+        detector.fit(X_train)
+
+        scores = detector.score(X_train)
+        assert not np.any(np.isnan(scores))
+        assert scores.shape == (10,)
+
+    def test_early_stopping_triggers(self):
+        """With enough epochs and patience, training should stop early."""
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 10)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=5,
+            hidden_dim=16,
+            latent_dim=4,
+            epochs=500,
+            early_stopping_patience=10,
+        )
+        detector.fit(X_train)
+
+        # Model should still produce valid scores regardless
+        scores = detector.score(X_train)
+        assert not np.any(np.isnan(scores))
+
+
+class TestAutoencoderPersistence:
+    def test_save_load_roundtrip(self, tmp_path):
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((100, 15)).astype(np.float32)
+        X_test = rng.standard_normal((20, 15)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=8, hidden_dim=16, latent_dim=4, epochs=50
+        )
+        detector.fit(X_train)
+        original_scores = detector.score(X_test)
+
+        model_dir = tmp_path / "autoencoder"
+        detector.save(model_dir)
+        loaded = AutoencoderDetector.load(model_dir)
+
+        loaded_scores = loaded.score(X_test)
+        np.testing.assert_array_almost_equal(loaded_scores, original_scores)
+
+    def test_save_preserves_config(self, tmp_path):
+        rng = np.random.default_rng(SEED)
+        X = rng.standard_normal((50, 10)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=7, latent_dim=3, hidden_dim=12, epochs=20,
+            batch_size=16, learning_rate=5e-4, early_stopping_patience=5,
+        )
+        detector.fit(X)
+        detector.save(tmp_path / "model")
+
+        loaded = AutoencoderDetector.load(tmp_path / "model")
+        assert loaded.n_components == 7
+        assert loaded.latent_dim == 3
+        assert loaded.hidden_dim == 12
+        assert loaded.epochs == 20
+        assert loaded.batch_size == 16
+        assert loaded.learning_rate == pytest.approx(5e-4)
+        assert loaded.early_stopping_patience == 5
+
+    def test_loaded_still_separates(self, tmp_path):
+        rng = np.random.default_rng(SEED)
+        X_train = rng.standard_normal((200, 20)).astype(np.float32)
+        X_normal = rng.standard_normal((50, 20)).astype(np.float32)
+        X_outlier = rng.standard_normal((50, 20)).astype(np.float32) + 8.0
+
+        detector = AutoencoderDetector(
+            n_components=10, hidden_dim=32, latent_dim=8, epochs=100
+        )
+        detector.fit(X_train)
+        detector.save(tmp_path / "model")
+
+        loaded = AutoencoderDetector.load(tmp_path / "model")
+        normal_scores = loaded.score(X_normal)
+        outlier_scores = loaded.score(X_outlier)
+
+        assert outlier_scores.mean() > normal_scores.mean()
+
+    def test_save_creates_parent_dirs(self, tmp_path):
+        rng = np.random.default_rng(SEED)
+        X = rng.standard_normal((30, 8)).astype(np.float32)
+
+        detector = AutoencoderDetector(
+            n_components=4, hidden_dim=8, latent_dim=2, epochs=10
+        )
+        detector.fit(X)
+
+        deep_path = tmp_path / "a" / "b" / "c"
+        detector.save(deep_path)
+        assert (deep_path / "pca.joblib").exists()
+        assert (deep_path / "autoencoder.pt").exists()
+        assert (deep_path / "config.npz").exists()
+
+
+class TestAutoencoderValidation:
+    def test_score_before_fit_raises(self):
+        detector = AutoencoderDetector(n_components=10)
+        X = np.random.default_rng(SEED).standard_normal((5, 10)).astype(np.float32)
+
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            detector.score(X)
+
+    def test_fit_1d_raises(self):
+        detector = AutoencoderDetector(n_components=5)
+        with pytest.raises(ValueError, match="2D"):
+            detector.fit(np.array([1.0, 2.0, 3.0]))
+
+    def test_fit_single_sample_raises(self):
+        detector = AutoencoderDetector(n_components=5)
+        with pytest.raises(ValueError, match="at least 2"):
+            detector.fit(np.array([[1.0, 2.0, 3.0]]))
+
+    def test_negative_components_raises(self):
+        with pytest.raises(ValueError, match="n_components"):
+            AutoencoderDetector(n_components=0)
+
+    def test_negative_latent_dim_raises(self):
+        with pytest.raises(ValueError, match="latent_dim"):
+            AutoencoderDetector(latent_dim=0)
+
+    def test_negative_hidden_dim_raises(self):
+        with pytest.raises(ValueError, match="hidden_dim"):
+            AutoencoderDetector(hidden_dim=0)
