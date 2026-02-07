@@ -15,7 +15,7 @@ import pytest
 
 from venator.activation.storage import ActivationStore
 from venator.config import VenatorConfig
-from venator.data.splits import DataSplit, SplitManager
+from venator.data.splits import DataSplit, SplitManager, SplitMode
 from venator.detection.ensemble import DetectorEnsemble, create_default_ensemble
 from venator.pipeline import VenatorPipeline
 
@@ -94,7 +94,7 @@ def populated_store(tmp_path, rng):
 def splits(populated_store):
     """Create splits from the populated store."""
     manager = SplitManager(seed=SEED)
-    return manager.create_splits(populated_store)
+    return manager.create_splits(populated_store, mode=SplitMode.UNSUPERVISED)
 
 
 @pytest.fixture
@@ -428,7 +428,7 @@ class TestEndToEnd:
 
         # Create splits
         manager = SplitManager(seed=SEED)
-        splits = manager.create_splits(store)
+        splits = manager.create_splits(store, mode=SplitMode.UNSUPERVISED)
 
         # Train
         train_metrics = pipeline.train(store, splits)

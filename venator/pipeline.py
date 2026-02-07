@@ -8,7 +8,7 @@ Usage::
     # Full pipeline (with MLX model)
     pipeline = VenatorPipeline.from_config()
     store = pipeline.extract_and_store(prompts, "data/activations/all.h5")
-    splits = SplitManager().create_splits(store)
+    splits = SplitManager().create_splits(store, mode=SplitMode.UNSUPERVISED)
     pipeline.train(store, splits)
     metrics = pipeline.evaluate(store, splits)
     result = pipeline.detect("Is this a jailbreak?")

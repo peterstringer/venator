@@ -7,7 +7,7 @@ import streamlit as st
 
 from venator.activation.storage import ActivationStore
 from venator.dashboard.state import PipelineState
-from venator.data.splits import SplitManager
+from venator.data.splits import SplitManager, SplitMode
 
 state = PipelineState()
 config = state.config
@@ -57,7 +57,7 @@ def _show_split_summary(
     # Run validation
     validation_passed = True
     try:
-        manager.validate_splits(splits, store)
+        manager.validate_splits(splits, store, mode=SplitMode.UNSUPERVISED)
     except ValueError as e:
         validation_passed = False
         st.error(f"Validation failed: {e}")
@@ -146,7 +146,12 @@ if st.button("Create Splits", type="primary"):
     manager = SplitManager(seed=int(seed))
 
     with st.spinner("Creating splits..."):
-        splits = manager.create_splits(store, train_frac=train_frac, val_frac=val_frac)
+        splits = manager.create_splits(
+            store,
+            mode=SplitMode.UNSUPERVISED,
+            benign_train_frac=train_frac,
+            benign_val_frac=val_frac,
+        )
 
     _show_split_summary(splits, store, manager)
 
@@ -165,7 +170,7 @@ if st.session_state.get("_splits") is not None:
         manager = st.session_state["_split_manager"]
         splits_path = config.data_dir / "splits.json"
 
-        manager.save_splits(splits, splits_path)
+        manager.save_splits(splits, splits_path, mode=SplitMode.UNSUPERVISED)
 
         state.reset_from(3)
         state.splits_path = splits_path

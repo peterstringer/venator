@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from venator.activation.storage import ActivationStore
-from venator.data.splits import SplitManager
+from venator.data.splits import SplitManager, SplitMode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,16 +82,17 @@ def main() -> None:
     manager = SplitManager(seed=args.seed)
     splits = manager.create_splits(
         store,
-        train_frac=args.train_frac,
-        val_frac=args.val_frac,
+        mode=SplitMode.UNSUPERVISED,
+        benign_train_frac=args.train_frac,
+        benign_val_frac=args.val_frac,
     )
 
     # Validate (also done inside create_splits, but explicit for user confidence)
-    manager.validate_splits(splits, store)
+    manager.validate_splits(splits, store, mode=SplitMode.UNSUPERVISED)
     logger.info("Validation passed: no jailbreaks in train/val")
 
     # Save
-    manager.save_splits(splits, args.output)
+    manager.save_splits(splits, args.output, mode=SplitMode.UNSUPERVISED)
 
     # Summary table
     print("\n" + "=" * 60)
