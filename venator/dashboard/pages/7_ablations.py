@@ -102,7 +102,7 @@ def _show_ablation_results(results: dict) -> None:
                 layers, aurocs, "Layer", "AUROC",
                 title="AUROC by Transformer Layer",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             best = max(layer_data, key=lambda r: r["auroc"])
             st.info(
@@ -133,7 +133,7 @@ def _show_ablation_results(results: dict) -> None:
                 dims, aurocs, "PCA Dimensions", "AUROC",
                 title="AUROC by PCA Dimensionality",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             best = max(pca_data, key=lambda r: r["auroc"])
             st.info(
@@ -188,7 +188,7 @@ def _show_ablation_results(results: dict) -> None:
                 margin=dict(t=40, b=40, l=40, r=20),
                 template="plotly_white",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             # Correlation heatmap
             if "detector_sample_scores" in results:
@@ -200,7 +200,7 @@ def _show_ablation_results(results: dict) -> None:
                     sample_scores,
                     title="Score Correlation Between Detectors",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             st.info(
                 "Low pairwise correlation between detectors confirms decorrelated "

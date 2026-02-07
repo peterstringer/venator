@@ -113,7 +113,7 @@ if st.button("Detect", type="primary", disabled=not prompt):
 
     with gauge_col:
         fig = score_gauge(result["ensemble_score"], result["threshold"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # --- Per-detector breakdown ---
     detector_scores = result["detector_scores"]
@@ -150,7 +150,7 @@ if st.button("Detect", type="primary", disabled=not prompt):
         margin=dict(t=40, b=40, l=120, r=40),
         xaxis=dict(range=[0, max(1.05, max(det_values) * 1.1)]),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # --- Append to session history ---
     if "_detect_history" not in st.session_state:

@@ -37,7 +37,7 @@ def _show_dataset_stats(dataset: PromptDataset, key_prefix: str) -> None:
     counts = dataset.source_counts()
     if counts:
         fig = source_distribution_chart(counts, title="Source Distribution")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with st.expander("Sample prompts (5 random)"):
         rng = random.Random(42)
         indices = rng.sample(range(len(dataset)), min(5, len(dataset)))
@@ -89,7 +89,13 @@ col_benign, col_jailbreak = st.columns(2)
 # ------------------------------------------------------------------
 
 with col_benign:
-    st.subheader("Benign Prompts")
+    _hdr_l, _rst_l = st.columns([3, 1])
+    _hdr_l.subheader("Benign Prompts")
+    if st.session_state.get("_benign_dataset") is not None:
+        if _rst_l.button("Reset", key="reset_benign", type="secondary"):
+            del st.session_state["_benign_dataset"]
+            state.prompts_ready = False
+            st.rerun()
     st.caption("Training distribution — used for train, validation, and test.")
 
     # Option A: Collect
@@ -126,7 +132,14 @@ with col_benign:
                     sources = [s for _, s in filtered]
                     ds = PromptDataset(prompts, [0] * len(prompts), sources)
                     st.session_state["_benign_dataset"] = ds
+                    counts = ds.source_counts()
+                    missing = allowed_keys - set(counts.keys())
                     st.success(f"Collected {len(ds)} benign prompts.")
+                    if missing:
+                        st.warning(
+                            f"Some sources returned no data: {', '.join(sorted(missing))}. "
+                            "This may be due to dataset download failures."
+                        )
 
     # Option B: Upload
     uploaded_benign = st.file_uploader(
@@ -151,7 +164,13 @@ with col_benign:
 # ------------------------------------------------------------------
 
 with col_jailbreak:
-    st.subheader("Jailbreak Prompts")
+    _hdr_r, _rst_r = st.columns([3, 1])
+    _hdr_r.subheader("Jailbreak Prompts")
+    if st.session_state.get("_jailbreak_dataset") is not None:
+        if _rst_r.button("Reset", key="reset_jailbreak", type="secondary"):
+            del st.session_state["_jailbreak_dataset"]
+            state.prompts_ready = False
+            st.rerun()
     st.caption("Test only — never used in training or validation.")
     st.warning(
         "These prompts are used **only for evaluation**. They will never "
@@ -159,6 +178,10 @@ with col_jailbreak:
     )
 
     # Option A: Collect
+    st.caption(
+        "Available: ~100 JailbreakBench + ~520 AdvBench + ~75 built-in patterns. "
+        "Actual count depends on dataset availability and deduplication."
+    )
     with st.form("collect_jailbreak_form"):
         n_jailbreak = st.slider(
             "Number of prompts",
@@ -191,7 +214,22 @@ with col_jailbreak:
                     sources = [s for _, s in filtered]
                     ds = PromptDataset(prompts, [1] * len(prompts), sources)
                     st.session_state["_jailbreak_dataset"] = ds
-                    st.success(f"Collected {len(ds)} jailbreak prompts.")
+                    # Show per-source breakdown and warn about missing sources
+                    counts = ds.source_counts()
+                    missing = allowed_keys - set(counts.keys())
+                    if len(ds) < n_jailbreak:
+                        st.warning(
+                            f"Collected **{len(ds)}** of {n_jailbreak} requested. "
+                            "Some sources may have failed to download or returned "
+                            "duplicates that were removed."
+                        )
+                    else:
+                        st.success(f"Collected {len(ds)} jailbreak prompts.")
+                    if missing:
+                        st.warning(
+                            f"Sources returned no data: {', '.join(sorted(missing))}. "
+                            "This may be due to dataset download failures."
+                        )
 
     # Option B: Upload
     uploaded_jailbreak = st.file_uploader(

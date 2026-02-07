@@ -141,9 +141,15 @@ class ActivationExtractor:
     def hidden_dim(self) -> int:
         """Dimensionality of the model's hidden states (e.g. 4096 for Mistral-7B)."""
         self._ensure_model_loaded()
+        # Prefer model args (always correct, even for quantized models)
+        if hasattr(self._model, "args") and hasattr(self._model.args, "hidden_size"):
+            return self._model.args.hidden_size
+        # Fallback: embedding layer — use .dims for QuantizedEmbedding,
+        # .weight.shape[1] for standard Embedding
         inner = self._get_inner_model()
         embed = _find_embedding_layer(inner)
-        # nn.Embedding.weight has shape (vocab_size, hidden_dim)
+        if hasattr(embed, "dims"):
+            return embed.dims
         return embed.weight.shape[1]
 
     @property
@@ -217,10 +223,10 @@ class ActivationExtractor:
 
         # Walk through transformer layers, capturing target outputs
         activations: dict[int, np.ndarray] = {}
-        cache = [None] * len(inner.layers)
 
         for i, layer in enumerate(inner.layers):
-            h, cache[i] = layer(h, mask=mask, cache=cache[i])
+            # mlx-lm >= 0.22: layers return just the hidden state (cache updated in-place)
+            h = layer(h, mask=mask, cache=None)
 
             if i in self._target_layers:
                 # Mean-pool across sequence dimension: (1, seq_len, hidden_dim) -> (hidden_dim,)

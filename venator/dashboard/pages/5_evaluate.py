@@ -79,7 +79,7 @@ def _show_results(eval_data: dict) -> None:
     viz_top1, viz_top2 = st.columns(2)
     with viz_top1:
         fig = score_distribution_chart(benign_scores, jailbreak_scores, threshold)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with viz_top2:
         roc_fpr = np.array(curves["roc_fpr"])
@@ -88,18 +88,18 @@ def _show_results(eval_data: dict) -> None:
         op_fpr = metrics.get("false_positive_rate")
         op_tpr = metrics.get("true_positive_rate")
         fig = roc_curve_chart(roc_fpr, roc_tpr, metrics["auroc"], op_fpr, op_tpr)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     viz_bot1, viz_bot2 = st.columns(2)
     with viz_bot1:
         fig = detector_comparison_chart(detector_aurocs)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with viz_bot2:
         # Compute PR curve from sklearn for smooth curves
         pr_precision, pr_recall, _ = precision_recall_curve(labels, scores)
         fig = precision_recall_chart(pr_recall, pr_precision, metrics["auprc"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # --- Detailed Results ---
     st.subheader("Detailed Results")

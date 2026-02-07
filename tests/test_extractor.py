@@ -76,9 +76,10 @@ class MockTransformerLayer:
 
     def __call__(self, h, mask=None, cache=None):
         # Add small perturbation to simulate layer transformation
+        # mlx-lm >= 0.22: layers return just the hidden state
         noise = self._rng.standard_normal(h.shape).astype(np.float32) * 0.1
         new_h = MockMxArray(np.array(h) + noise)
-        return new_h, cache
+        return new_h
 
 
 class MockInnerModel:
@@ -90,11 +91,17 @@ class MockInnerModel:
         self.norm = MagicMock()
 
 
+class _MockArgs:
+    """Simulates the ModelArgs dataclass from mlx-lm."""
+    hidden_size = HIDDEN_DIM
+
+
 class MockModel:
     """Simulates the mlx-lm Model wrapper."""
 
     def __init__(self, rng: np.random.Generator):
         self.model = MockInnerModel(rng)
+        self.args = _MockArgs()
 
 
 class MockTokenizer:

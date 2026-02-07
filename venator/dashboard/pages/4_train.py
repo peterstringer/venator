@@ -72,6 +72,16 @@ st.subheader("Configuration")
 store = ActivationStore(state.store_path)
 available_layers = store.layers
 
+auto_tune = st.toggle(
+    "Auto-tune PCA dimensions and threshold",
+    value=False,
+    help=(
+        "Automatically select the best PCA dimensions by maximizing explained "
+        "variance while maintaining a healthy sample-to-feature ratio, and "
+        "optimize the threshold percentile using validation score distribution."
+    ),
+)
+
 cfg_col1, cfg_col2 = st.columns(2)
 with cfg_col1:
     # Default to middle layer
@@ -87,6 +97,8 @@ with cfg_col1:
         max_value=100,
         value=config.pca_dims,
         step=5,
+        disabled=auto_tune,
+        help="Disabled when auto-tune is on." if auto_tune else None,
     )
 
 with cfg_col2:
@@ -96,6 +108,8 @@ with cfg_col2:
         max_value=99.0,
         value=config.anomaly_threshold_percentile,
         step=0.5,
+        disabled=auto_tune,
+        help="Disabled when auto-tune is on." if auto_tune else None,
     )
 
 st.subheader("Detector Selection")
@@ -136,11 +150,82 @@ if st.button("Train Ensemble", type="primary"):
     X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
     X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
 
+    # --- Auto-tune PCA dims and threshold if enabled ---
+    if auto_tune:
+        from sklearn.decomposition import PCA  # type: ignore[import-untyped]
+
+        with st.status("Auto-tuning hyperparameters...", expanded=True) as tune_status:
+            # 1. Find best PCA dims via explained variance + sample/feature ratio
+            st.write("Testing PCA dimensions...")
+            candidates = [d for d in [10, 20, 30, 40, 50, 75, 100]
+                          if d < X_train.shape[0] // 5]  # Maintain 5x sample/feature ratio
+            if not candidates:
+                candidates = [max(5, X_train.shape[0] // 10)]
+
+            best_dims = candidates[0]
+            best_score = -1.0
+            tune_results = []
+            for d in candidates:
+                pca = PCA(n_components=d)
+                pca.fit(X_train)
+                explained = float(np.sum(pca.explained_variance_ratio_))
+                ratio = X_train.shape[0] / d
+                # Score: explained variance penalized by low sample/feature ratio
+                penalty = min(1.0, ratio / 7.0)  # 7x is healthy target
+                score = explained * penalty
+                tune_results.append((d, explained, ratio, score))
+                if score > best_score:
+                    best_score = score
+                    best_dims = d
+            pca_dims = best_dims
+
+            results_text = " | ".join(
+                f"d={d}: var={v:.2%}, ratio={r:.1f}x" for d, v, r, _ in tune_results
+            )
+            st.write(f"Candidates: {results_text}")
+            st.write(f"Selected PCA dims: **{pca_dims}** (score={best_score:.3f})")
+
+            # 2. Optimize threshold percentile
+            # Train a quick PCA+Mahalanobis to get val score distribution,
+            # then pick the percentile that minimizes expected FPR while keeping
+            # detection margin above normal scores
+            st.write("Optimizing threshold percentile...")
+            probe = PCAMahalanobisDetector(n_components=pca_dims)
+            probe.fit(X_train)
+            val_scores = probe.score(X_val)
+            train_scores = probe.score(X_train)
+
+            # Use the gap between high-percentile val scores and median train score
+            # Pick the percentile where the score is well-separated from the bulk
+            best_pctile = 95.0
+            best_gap = 0.0
+            median_train = float(np.median(train_scores))
+            for pctile in [90.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0, 99.0]:
+                thresh = float(np.percentile(val_scores, pctile))
+                fpr = float(np.mean(val_scores > thresh))
+                # Prefer percentiles that keep FPR reasonable (3-7%)
+                # while maximizing separation from training median
+                gap = thresh - median_train
+                fpr_penalty = abs(fpr - 0.05) * 10  # Target ~5% FPR
+                adjusted = gap - fpr_penalty
+                if adjusted > best_gap:
+                    best_gap = adjusted
+                    best_pctile = pctile
+
+            threshold_pctile = best_pctile
+            st.write(f"Selected threshold percentile: **{threshold_pctile}%**")
+            tune_status.update(
+                label=f"Auto-tune complete: PCA={pca_dims}, threshold={threshold_pctile}%",
+                state="complete",
+            )
+
     st.info(
         f"Training data: **{len(X_train)}** samples, "
         f"validation: **{len(X_val)}** samples, "
         f"features: **{X_train.shape[1]}** dims, "
-        f"layer: **{layer}**"
+        f"layer: **{layer}**, "
+        f"PCA dims: **{pca_dims}**, "
+        f"threshold: **{threshold_pctile}%**"
     )
 
     # Build ensemble
@@ -180,11 +265,11 @@ if st.button("Train Ensemble", type="primary"):
     output_dir = config.models_dir / "detector_v1"
     ensemble.save(output_dir)
 
-    # Save pipeline metadata
+    # Save pipeline metadata (convert numpy types for JSON compatibility)
     meta = {
-        "layer": layer,
+        "layer": int(layer),
         "model_id": store.model_id,
-        "extraction_layers": store.layers,
+        "extraction_layers": [int(l) for l in store.layers],
     }
     with open(output_dir / "pipeline_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -193,9 +278,9 @@ if st.button("Train Ensemble", type="primary"):
     train_metrics = {
         "val_false_positive_rate": val_fpr,
         "threshold": float(ensemble.threshold_),
-        "layer": layer,
-        "pca_dims": pca_dims,
-        "n_detectors": n_detectors,
+        "layer": int(layer),
+        "pca_dims": int(pca_dims),
+        "n_detectors": int(n_detectors),
         "training_time_s": round(elapsed, 1),
     }
 
