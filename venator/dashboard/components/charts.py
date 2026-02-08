@@ -381,3 +381,201 @@ def correlation_heatmap(
         yaxis=dict(scaleanchor="x"),
     )
     return fig
+
+
+def detector_comparison_grouped_bar(
+    unsupervised_metrics: dict[str, float],
+    supervised_metrics: dict[str, float],
+    metric_name: str = "AUROC",
+) -> go.Figure:
+    """Grouped bar chart: unsupervised (blue) vs supervised (green) detectors.
+
+    Args:
+        unsupervised_metrics: Mapping of detector name to metric value.
+        supervised_metrics: Mapping of detector name to metric value.
+        metric_name: The metric being compared (for axis label).
+
+    Returns:
+        Plotly Figure with grouped bars color-coded by detector type.
+    """
+    all_names = list(unsupervised_metrics.keys()) + list(supervised_metrics.keys())
+    unsup_vals = [unsupervised_metrics.get(n, 0) for n in all_names]
+    sup_vals = [supervised_metrics.get(n, 0) for n in all_names]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="Unsupervised",
+        x=all_names,
+        y=unsup_vals,
+        marker_color="rgba(55, 128, 191, 0.8)",
+        text=[f"{v:.3f}" if v > 0 else "" for v in unsup_vals],
+        textposition="outside",
+    ))
+    fig.add_trace(go.Bar(
+        name="Supervised",
+        x=all_names,
+        y=sup_vals,
+        marker_color="rgba(44, 160, 101, 0.8)",
+        text=[f"{v:.3f}" if v > 0 else "" for v in sup_vals],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        barmode="group",
+        title=f"{metric_name} by Detector (Unsupervised vs Supervised)",
+        yaxis_title=metric_name,
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+        yaxis=dict(range=[0, 1.05]),
+    )
+    return fig
+
+
+def labeled_data_efficiency_chart(
+    n_labeled: list[int],
+    aurocs_by_detector: dict[str, list[float]],
+    unsupervised_baselines: dict[str, float],
+) -> go.Figure:
+    """Line chart showing AUROC vs number of labeled jailbreaks.
+
+    Dashed horizontal lines for unsupervised baselines.
+
+    Args:
+        n_labeled: X-axis values (number of labeled jailbreaks).
+        aurocs_by_detector: Detector name -> list of AUROC values per n_labeled.
+        unsupervised_baselines: Detector name -> AUROC baseline value.
+
+    Returns:
+        Plotly Figure with efficiency curves and baseline references.
+    """
+    # Supervised detector colors (green shades)
+    sup_colors = [
+        "rgba(44, 160, 101, 1)",
+        "rgba(0, 128, 128, 1)",
+        "rgba(76, 175, 80, 1)",
+        "rgba(27, 94, 32, 1)",
+    ]
+    # Unsupervised baseline colors (blue shades)
+    unsup_colors = [
+        "rgba(55, 128, 191, 0.6)",
+        "rgba(100, 149, 237, 0.6)",
+        "rgba(70, 130, 180, 0.6)",
+    ]
+
+    fig = go.Figure()
+
+    for i, (name, aurocs) in enumerate(aurocs_by_detector.items()):
+        color = sup_colors[i % len(sup_colors)]
+        fig.add_trace(go.Scatter(
+            x=n_labeled,
+            y=aurocs,
+            mode="lines+markers",
+            name=name,
+            line=dict(color=color),
+            marker=dict(size=8),
+        ))
+
+    for i, (name, baseline) in enumerate(unsupervised_baselines.items()):
+        color = unsup_colors[i % len(unsup_colors)]
+        fig.add_hline(
+            y=baseline,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=f"{name}: {baseline:.3f}",
+            annotation_position="top left" if i % 2 == 0 else "bottom left",
+        )
+
+    fig.update_layout(
+        title="Labeled Data Efficiency: AUROC vs Number of Labeled Jailbreaks",
+        xaxis_title="Number of Labeled Jailbreaks",
+        yaxis_title="AUROC",
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+        yaxis=dict(range=[0, 1.05]),
+    )
+    return fig
+
+
+def generalization_heatmap(
+    sources: list[str],
+    auroc_matrix: np.ndarray,
+) -> go.Figure:
+    """Heatmap of cross-source generalization performance.
+
+    Args:
+        sources: Source names (used for both axes).
+        auroc_matrix: 2D array of AUROC values (rows=trained on, cols=tested on).
+
+    Returns:
+        Plotly Figure with a generalization heatmap.
+    """
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=auroc_matrix,
+            x=[f"Test: {s}" for s in sources],
+            y=[f"Train: {s}" for s in sources],
+            colorscale="Viridis",
+            zmin=0.5,
+            zmax=1.0,
+            texttemplate="%{z:.3f}",
+            textfont=dict(size=12),
+        )
+    )
+    fig.update_layout(
+        title="Cross-Source Generalization (AUROC)",
+        height=400,
+        margin=dict(t=40, b=80, l=100, r=20),
+        template="plotly_white",
+        yaxis=dict(scaleanchor="x"),
+    )
+    return fig
+
+
+def ensemble_roc_comparison(
+    roc_curves: dict[str, tuple[np.ndarray, np.ndarray, float]],
+) -> go.Figure:
+    """Multiple ROC curves on same plot for ensemble comparison.
+
+    Args:
+        roc_curves: Mapping of ensemble name to (fpr, tpr, auroc).
+
+    Returns:
+        Plotly Figure with overlaid ROC curves.
+    """
+    colors = [
+        "rgba(55, 128, 191, 1)",   # blue - unsupervised
+        "rgba(44, 160, 101, 1)",   # green - supervised
+        "rgba(219, 64, 82, 1)",    # red - hybrid
+        "rgba(153, 102, 204, 1)",  # purple - extra
+    ]
+
+    fig = go.Figure()
+    # Diagonal reference
+    fig.add_trace(go.Scatter(
+        x=[0, 1], y=[0, 1],
+        mode="lines",
+        line=dict(dash="dash", color="lightgray"),
+        showlegend=False,
+    ))
+
+    for i, (name, (fpr, tpr, auroc)) in enumerate(roc_curves.items()):
+        color = colors[i % len(colors)]
+        fig.add_trace(go.Scatter(
+            x=fpr, y=tpr,
+            mode="lines",
+            name=f"{name} (AUC={auroc:.3f})",
+            line=dict(color=color, width=2),
+        ))
+
+    fig.update_layout(
+        title="ROC Curve Comparison",
+        xaxis_title="False Positive Rate",
+        yaxis_title="True Positive Rate",
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+        xaxis=dict(range=[0, 1]),
+        yaxis=dict(range=[0, 1.05]),
+    )
+    return fig
