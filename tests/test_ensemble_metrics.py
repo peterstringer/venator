@@ -13,8 +13,12 @@ import pytest
 from venator.detection.ensemble import (
     DetectorEnsemble,
     DetectorResult,
+    DetectorType,
     EnsembleResult,
     create_default_ensemble,
+    create_hybrid_ensemble,
+    create_supervised_ensemble,
+    create_unsupervised_ensemble,
 )
 from venator.detection.metrics import compute_threshold_curves, evaluate_detector
 from venator.detection.pca_mahalanobis import PCAMahalanobisDetector
@@ -614,3 +618,525 @@ class TestEnsembleMetricsIntegration:
 
         # With a good threshold, recall should be high
         assert metrics["recall"] > 0.80
+
+
+# ===========================================================================
+# DetectorType enum
+# ===========================================================================
+
+
+class TestDetectorType:
+    def test_values(self):
+        assert DetectorType.UNSUPERVISED.value == "unsupervised"
+        assert DetectorType.SUPERVISED.value == "supervised"
+
+    def test_str_enum(self):
+        assert str(DetectorType.UNSUPERVISED) == "DetectorType.UNSUPERVISED"
+        assert DetectorType("unsupervised") == DetectorType.UNSUPERVISED
+
+    def test_default_is_unsupervised(self):
+        e = DetectorEnsemble()
+        e.add_detector("test", PCAMahalanobisDetector(n_components=5))
+        assert e.detector_types_["test"] == DetectorType.UNSUPERVISED
+
+    def test_explicit_type_stored(self):
+        e = DetectorEnsemble()
+        e.add_detector(
+            "test",
+            PCAMahalanobisDetector(n_components=5),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        assert e.detector_types_["test"] == DetectorType.SUPERVISED
+
+
+# ===========================================================================
+# Supervised ensemble: fit with labeled data
+# ===========================================================================
+
+
+def _make_supervised_data(
+    n_train_benign: int = 150,
+    n_train_jailbreak: int = 30,
+    n_val_benign: int = 50,
+    n_val_jailbreak: int = 20,
+    n_test_normal: int = 50,
+    n_test_outlier: int = 50,
+    n_features: int = 20,
+    outlier_shift: float = 5.0,
+    seed: int = SEED,
+) -> dict[str, np.ndarray]:
+    """Create train/val/test data for supervised ensemble testing."""
+    rng = np.random.default_rng(seed)
+    return {
+        "X_train_benign": rng.standard_normal(
+            (n_train_benign, n_features)
+        ).astype(np.float32),
+        "X_train_jailbreak": (
+            rng.standard_normal((n_train_jailbreak, n_features)).astype(np.float32)
+            + outlier_shift
+        ),
+        "X_val_benign": rng.standard_normal(
+            (n_val_benign, n_features)
+        ).astype(np.float32),
+        "X_val_jailbreak": (
+            rng.standard_normal((n_val_jailbreak, n_features)).astype(np.float32)
+            + outlier_shift
+        ),
+        "X_test_normal": rng.standard_normal(
+            (n_test_normal, n_features)
+        ).astype(np.float32),
+        "X_test_outlier": (
+            rng.standard_normal((n_test_outlier, n_features)).astype(np.float32)
+            + outlier_shift
+        ),
+    }
+
+
+@pytest.fixture
+def supervised_data():
+    return _make_supervised_data()
+
+
+class TestSupervisedEnsembleFit:
+    """Test fitting supervised detectors via the ensemble."""
+
+    def test_supervised_detector_requires_jailbreak_data(self):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        data = _make_supervised_data()
+        with pytest.raises(ValueError, match="supervised.*jailbreak"):
+            e.fit(data["X_train_benign"], data["X_val_benign"])
+
+    def test_supervised_fit_succeeds(self, supervised_data):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        assert e.threshold_ is not None
+        assert e.train_scores_ is not None
+
+    def test_supervised_separates(self, supervised_data):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        normal = e.score(d["X_test_normal"])
+        outlier = e.score(d["X_test_outlier"])
+        assert outlier.ensemble_scores.mean() > normal.ensemble_scores.mean()
+
+    def test_normalization_against_benign_train(self, supervised_data):
+        """All detectors normalized against benign training scores only."""
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        # Train scores should be computed on benign data only
+        assert len(e.train_scores_["cd"]) == len(d["X_train_benign"])
+
+
+# ===========================================================================
+# Hybrid ensemble: mixed supervised + unsupervised detectors
+# ===========================================================================
+
+
+class TestHybridEnsembleFit:
+    """Test mixed ensemble with both supervised and unsupervised detectors."""
+
+    def test_hybrid_fit_routes_data_correctly(self, supervised_data):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "mahal",
+            PCAMahalanobisDetector(n_components=10),
+            weight=2.0,
+            detector_type=DetectorType.UNSUPERVISED,
+        )
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            weight=1.5,
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        assert e.threshold_ is not None
+        # Both detectors should have benign-only train scores
+        assert len(e.train_scores_["mahal"]) == len(d["X_train_benign"])
+        assert len(e.train_scores_["cd"]) == len(d["X_train_benign"])
+
+    def test_hybrid_separates(self, supervised_data):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "mahal",
+            PCAMahalanobisDetector(n_components=10),
+            weight=2.0,
+            detector_type=DetectorType.UNSUPERVISED,
+        )
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            weight=1.5,
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        normal = e.score(d["X_test_normal"])
+        outlier = e.score(d["X_test_outlier"])
+        assert outlier.ensemble_scores.mean() > normal.ensemble_scores.mean()
+
+    def test_hybrid_auroc_high(self, supervised_data):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        e = DetectorEnsemble()
+        e.add_detector(
+            "mahal",
+            PCAMahalanobisDetector(n_components=10),
+            weight=2.0,
+            detector_type=DetectorType.UNSUPERVISED,
+        )
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            weight=1.5,
+            detector_type=DetectorType.SUPERVISED,
+        )
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        X_test = np.vstack([d["X_test_normal"], d["X_test_outlier"]])
+        labels = np.array(
+            [0] * len(d["X_test_normal"]) + [1] * len(d["X_test_outlier"])
+        )
+        result = e.score(X_test)
+        metrics = evaluate_detector(result.ensemble_scores, labels)
+        assert metrics["auroc"] > 0.90
+
+
+# ===========================================================================
+# Supervised threshold calibration
+# ===========================================================================
+
+
+class TestSupervisedThresholdCalibration:
+    """Test threshold calibration methods with labeled validation data."""
+
+    def test_youden_is_default(self, supervised_data):
+        """When jailbreak val data provided, Youden's J is the default."""
+        e = _make_simple_ensemble()
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        threshold_youden = e.threshold_
+
+        e2 = _make_simple_ensemble()
+        e2.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+            threshold_method="youden",
+        )
+        assert threshold_youden == pytest.approx(e2.threshold_)
+
+    def test_f1_method(self, supervised_data):
+        e = _make_simple_ensemble()
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+            threshold_method="f1",
+        )
+        assert e.threshold_ is not None
+        assert isinstance(e.threshold_, float)
+
+    def test_fpr_target_method(self, supervised_data):
+        e = _make_simple_ensemble()
+        d = supervised_data
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+            threshold_method="fpr_target",
+        )
+        assert e.threshold_ is not None
+
+    def test_percentile_override(self, supervised_data):
+        """threshold_method='percentile' ignores jailbreak val data."""
+        d = supervised_data
+        e_percentile = _make_simple_ensemble()
+        e_percentile.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+            threshold_method="percentile",
+        )
+
+        e_no_jailbreak = _make_simple_ensemble()
+        e_no_jailbreak.fit(d["X_train_benign"], d["X_val_benign"])
+
+        assert e_percentile.threshold_ == pytest.approx(e_no_jailbreak.threshold_)
+
+    def test_unknown_method_raises(self, supervised_data):
+        e = _make_simple_ensemble()
+        d = supervised_data
+        with pytest.raises(ValueError, match="Unknown threshold method"):
+            e.fit(
+                d["X_train_benign"],
+                d["X_val_benign"],
+                X_val_jailbreak=d["X_val_jailbreak"],
+                threshold_method="nonexistent",
+            )
+
+    def test_supervised_threshold_better_recall(self, supervised_data):
+        """Supervised threshold calibration should give better recall than percentile."""
+        d = supervised_data
+        X_test = np.vstack([d["X_test_normal"], d["X_test_outlier"]])
+        labels = np.array(
+            [0] * len(d["X_test_normal"]) + [1] * len(d["X_test_outlier"])
+        )
+
+        e_sup = _make_simple_ensemble()
+        e_sup.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+        sup_result = e_sup.score(X_test)
+        sup_metrics = evaluate_detector(
+            sup_result.ensemble_scores, labels, threshold=sup_result.threshold
+        )
+
+        # Supervised should have reasonable recall
+        assert sup_metrics["recall"] > 0.5
+
+
+# ===========================================================================
+# Ensemble: save/load with detector types
+# ===========================================================================
+
+
+class TestDetectorTypePersistence:
+    """Test that detector types are preserved across save/load."""
+
+    def test_unsupervised_type_roundtrip(self, tmp_path, ensemble_data):
+        X_train, X_val, _, _ = ensemble_data
+        e = _make_simple_ensemble()
+        e.fit(X_train, X_val)
+
+        e.save(tmp_path / "ens")
+        loaded = DetectorEnsemble.load(tmp_path / "ens")
+
+        assert loaded.detector_types_["mahal"] == DetectorType.UNSUPERVISED
+
+    def test_supervised_type_roundtrip(self, tmp_path):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        d = _make_supervised_data()
+        e = DetectorEnsemble()
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+
+        e.save(tmp_path / "ens")
+        loaded = DetectorEnsemble.load(tmp_path / "ens")
+
+        assert loaded.detector_types_["cd"] == DetectorType.SUPERVISED
+
+    def test_hybrid_type_roundtrip(self, tmp_path):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        d = _make_supervised_data()
+        e = DetectorEnsemble()
+        e.add_detector(
+            "mahal",
+            PCAMahalanobisDetector(n_components=10),
+            detector_type=DetectorType.UNSUPERVISED,
+        )
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+
+        e.save(tmp_path / "ens")
+        loaded = DetectorEnsemble.load(tmp_path / "ens")
+
+        assert loaded.detector_types_["mahal"] == DetectorType.UNSUPERVISED
+        assert loaded.detector_types_["cd"] == DetectorType.SUPERVISED
+
+    def test_loaded_hybrid_scores_match(self, tmp_path):
+        from venator.detection.contrastive import ContrastiveDirectionDetector
+
+        d = _make_supervised_data()
+        e = DetectorEnsemble()
+        e.add_detector(
+            "mahal",
+            PCAMahalanobisDetector(n_components=10),
+            detector_type=DetectorType.UNSUPERVISED,
+        )
+        e.add_detector(
+            "cd",
+            ContrastiveDirectionDetector(),
+            detector_type=DetectorType.SUPERVISED,
+        )
+        e.fit(
+            d["X_train_benign"],
+            d["X_val_benign"],
+            X_train_jailbreak=d["X_train_jailbreak"],
+            X_val_jailbreak=d["X_val_jailbreak"],
+        )
+
+        original = e.score(d["X_test_normal"])
+        e.save(tmp_path / "ens")
+        loaded = DetectorEnsemble.load(tmp_path / "ens")
+        loaded_result = loaded.score(d["X_test_normal"])
+
+        np.testing.assert_array_almost_equal(
+            loaded_result.ensemble_scores, original.ensemble_scores, decimal=4
+        )
+
+    def test_legacy_load_defaults_to_unsupervised(self, tmp_path, ensemble_data):
+        """Old saved models without detector_type should load as unsupervised."""
+        import json
+
+        X_train, X_val, _, _ = ensemble_data
+        e = _make_simple_ensemble()
+        e.fit(X_train, X_val)
+        e.save(tmp_path / "ens")
+
+        # Manually remove detector_type from saved config
+        config_path = tmp_path / "ens" / "ensemble_config.json"
+        with open(config_path) as f:
+            config = json.load(f)
+        for d in config["detectors"]:
+            d.pop("detector_type", None)
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        loaded = DetectorEnsemble.load(tmp_path / "ens")
+        assert loaded.detector_types_["mahal"] == DetectorType.UNSUPERVISED
+
+
+# ===========================================================================
+# Factory functions
+# ===========================================================================
+
+
+class TestFactoryFunctions:
+    def test_unsupervised_same_as_default(self):
+        e = create_unsupervised_ensemble()
+        names = [n for n, _, _ in e.detectors]
+        assert names == ["pca_mahalanobis", "isolation_forest", "autoencoder"]
+        for name in names:
+            assert e.detector_types_[name] == DetectorType.UNSUPERVISED
+
+    def test_supervised_has_all_supervised(self):
+        e = create_supervised_ensemble()
+        names = [n for n, _, _ in e.detectors]
+        assert "linear_probe" in names
+        assert "contrastive_direction" in names
+        assert "contrastive_mahalanobis" in names
+        for name in names:
+            assert e.detector_types_[name] == DetectorType.SUPERVISED
+
+    def test_supervised_weights(self):
+        e = create_supervised_ensemble()
+        weights = {n: w for n, _, w in e.detectors}
+        assert weights["linear_probe"] == 2.5
+        assert weights["contrastive_direction"] == 2.0
+        assert weights["contrastive_mahalanobis"] == 1.5
+
+    def test_hybrid_has_mixed_types(self):
+        e = create_hybrid_ensemble()
+        assert e.detector_types_["linear_probe"] == DetectorType.SUPERVISED
+        assert e.detector_types_["contrastive_direction"] == DetectorType.SUPERVISED
+        assert e.detector_types_["autoencoder"] == DetectorType.UNSUPERVISED
+
+    def test_hybrid_weights(self):
+        e = create_hybrid_ensemble()
+        weights = {n: w for n, _, w in e.detectors}
+        assert weights["linear_probe"] == 2.5
+        assert weights["contrastive_direction"] == 2.0
+        assert weights["autoencoder"] == 1.0
+
+    def test_custom_percentile_all_factories(self):
+        for factory in (
+            create_unsupervised_ensemble,
+            create_supervised_ensemble,
+            create_hybrid_ensemble,
+        ):
+            e = factory(threshold_percentile=99.0)
+            assert e.threshold_percentile == 99.0

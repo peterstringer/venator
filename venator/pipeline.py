@@ -205,33 +205,75 @@ class VenatorPipeline:
         store: ActivationStore,
         splits: dict[str, DataSplit],
     ) -> dict[str, float]:
-        """Train the ensemble on benign-only data and calibrate the threshold.
+        """Train the ensemble and calibrate the threshold.
+
+        Automatically detects the split mode from the split keys:
+        - Unsupervised (keys: "train", "val"): fits on benign data only.
+        - Semi-supervised (keys: "train_benign", "train_jailbreak", ...):
+          passes labeled jailbreak data to supervised detectors and enables
+          supervised threshold calibration.
 
         Args:
             store: ActivationStore with extracted activations.
-            splits: Must contain ``"train"`` and ``"val"`` keys (benign-only splits).
+            splits: Split dict from SplitManager. Either unsupervised
+                (``"train"``/``"val"``) or semi-supervised
+                (``"train_benign"``/``"val_benign"``/``"train_jailbreak"``/
+                ``"val_jailbreak"``).
 
         Returns:
             Dict with ``"val_false_positive_rate"`` — the fraction of benign
             validation samples flagged as anomalous by the calibrated threshold.
         """
-        X_train = store.get_activations(
-            self.layer, indices=splits["train"].indices.tolist()
-        )
-        X_val = store.get_activations(
-            self.layer, indices=splits["val"].indices.tolist()
-        )
+        # Detect split mode from keys
+        if "train" in splits:
+            # Unsupervised mode
+            X_train = store.get_activations(
+                self.layer, indices=splits["train"].indices.tolist()
+            )
+            X_val = store.get_activations(
+                self.layer, indices=splits["val"].indices.tolist()
+            )
+            X_train_jailbreak = None
+            X_val_jailbreak = None
+        elif "train_benign" in splits:
+            # Semi-supervised mode
+            X_train = store.get_activations(
+                self.layer, indices=splits["train_benign"].indices.tolist()
+            )
+            X_val = store.get_activations(
+                self.layer, indices=splits["val_benign"].indices.tolist()
+            )
+            X_train_jailbreak = store.get_activations(
+                self.layer, indices=splits["train_jailbreak"].indices.tolist()
+            )
+            X_val_jailbreak = store.get_activations(
+                self.layer, indices=splits["val_jailbreak"].indices.tolist()
+            )
+        else:
+            raise ValueError(
+                f"Unrecognized split keys: {set(splits.keys())}. "
+                "Expected 'train'/'val' (unsupervised) or "
+                "'train_benign'/'val_benign' (semi-supervised)."
+            )
 
         logger.info(
-            "Training ensemble: layer=%d, n_train=%d, n_val=%d",
+            "Training ensemble: layer=%d, n_train=%d, n_val=%d%s",
             self.layer,
             len(X_train),
             len(X_val),
+            f", n_train_jailbreak={len(X_train_jailbreak)}, "
+            f"n_val_jailbreak={len(X_val_jailbreak)}"
+            if X_train_jailbreak is not None
+            else "",
         )
 
-        self.ensemble.fit(X_train, X_val)
+        self.ensemble.fit(
+            X_train, X_val,
+            X_train_jailbreak=X_train_jailbreak,
+            X_val_jailbreak=X_val_jailbreak,
+        )
 
-        # Compute validation false positive rate
+        # Compute validation false positive rate (benign val only)
         val_result = self.ensemble.score(X_val)
         val_fpr = float(np.mean(val_result.is_anomaly))
 

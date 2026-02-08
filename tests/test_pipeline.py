@@ -16,7 +16,12 @@ import pytest
 from venator.activation.storage import ActivationStore
 from venator.config import VenatorConfig
 from venator.data.splits import DataSplit, SplitManager, SplitMode
-from venator.detection.ensemble import DetectorEnsemble, create_default_ensemble
+from venator.detection.ensemble import (
+    DetectorEnsemble,
+    DetectorType,
+    create_default_ensemble,
+    create_hybrid_ensemble,
+)
 from venator.pipeline import VenatorPipeline
 
 SEED = 42
@@ -442,3 +447,46 @@ class TestEndToEnd:
         result = pipeline.detect("some prompt")
         assert "is_anomaly" in result
         assert isinstance(result["is_anomaly"], bool)
+
+
+# ===========================================================================
+# TestSemiSupervisedTraining
+# ===========================================================================
+
+
+class TestSemiSupervisedTraining:
+    """Test pipeline.train() with semi-supervised splits."""
+
+    @pytest.fixture
+    def semi_splits(self, populated_store):
+        """Create semi-supervised splits from the populated store."""
+        manager = SplitManager(seed=SEED)
+        return manager.create_splits(populated_store, mode=SplitMode.SEMI_SUPERVISED)
+
+    def test_train_with_semi_supervised_splits(self, populated_store, semi_splits):
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(populated_store, semi_splits)
+        assert "val_false_positive_rate" in metrics
+        assert 0.0 <= metrics["val_false_positive_rate"] <= 1.0
+
+    def test_train_hybrid_with_semi_supervised(self, populated_store, semi_splits):
+        ensemble = create_hybrid_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(populated_store, semi_splits)
+        assert "val_false_positive_rate" in metrics
+
+    def test_evaluate_after_semi_supervised_train(self, populated_store, semi_splits):
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        pipeline.train(populated_store, semi_splits)
+        metrics = pipeline.evaluate(populated_store, semi_splits)
+        assert "auroc" in metrics
+        assert metrics["auroc"] > 0.8
+
+    def test_unrecognized_split_keys_raises(self, populated_store):
+        bad_splits = {"foo": DataSplit("foo", np.array([0, 1]), 2, False)}
+        ensemble = create_default_ensemble()
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        with pytest.raises(ValueError, match="Unrecognized split keys"):
+            pipeline.train(populated_store, bad_splits)

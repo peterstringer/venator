@@ -4,11 +4,16 @@ Combines multiple detectors with decorrelated errors for robust detection
 (per ELK paper: "useful even when no more accurate, as long as errors are
 decorrelated"). Normalizes scores to common scale before weighted combination.
 
+Supports both unsupervised detectors (fit on benign data only) and supervised
+detectors (fit on labeled benign + jailbreak data). When labeled validation
+data is available, uses Youden's J statistic for optimal threshold selection
+instead of the simpler percentile-based calibration.
+
 Score combination pipeline:
     1. Each detector produces raw anomaly scores.
-    2. Normalize each to [0, 1] via percentile rank against training scores.
+    2. Normalize each to [0, 1] via percentile rank against benign training scores.
     3. Weighted average of normalized scores.
-    4. Threshold calibrated from validation set at a chosen percentile.
+    4. Threshold calibrated from validation set (percentile or supervised method).
 """
 
 from __future__ import annotations
@@ -16,9 +21,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
+from sklearn.metrics import roc_curve  # type: ignore[import-untyped]
 
 from venator.detection.autoencoder import AutoencoderDetector
 from venator.detection.base import AnomalyDetector
@@ -26,6 +33,13 @@ from venator.detection.isolation_forest import IsolationForestDetector
 from venator.detection.pca_mahalanobis import PCAMahalanobisDetector
 
 logger = logging.getLogger(__name__)
+
+
+class DetectorType(str, Enum):
+    """Whether a detector requires labeled data for training."""
+
+    UNSUPERVISED = "unsupervised"  # fit(X) — benign data only
+    SUPERVISED = "supervised"  # fit(X, y) — labeled data
 
 
 @dataclass
@@ -56,15 +70,19 @@ class DetectorEnsemble:
     decorrelated."
 
     The ensemble normalizes each detector's scores to a common [0, 1] scale
-    via percentile rank against training scores, then takes a weighted average.
-    The threshold is calibrated on a validation set (benign-only) at a chosen
-    percentile.
+    via percentile rank against benign training scores, then takes a weighted
+    average. The threshold is calibrated on a validation set — either at a
+    chosen percentile (unsupervised) or via Youden's J / F1 (supervised).
+
+    Supports mixed ensembles with both unsupervised and supervised detectors.
+    Unsupervised detectors are fitted on benign data only; supervised detectors
+    are fitted on combined benign + jailbreak data with labels.
 
     Attributes:
         threshold_percentile: Percentile of validation ensemble scores to use
-            as the anomaly threshold. E.g. 95.0 means ~5% of benign validation
-            samples will be flagged as anomalous (false positive rate control).
+            as the anomaly threshold (used when no labeled val data available).
         detectors: List of (name, detector, weight) tuples.
+        detector_types_: Mapping from detector name to DetectorType.
         train_scores_: Raw training scores per detector, for normalization.
         threshold_: Calibrated decision threshold (set after fit).
     """
@@ -76,11 +94,16 @@ class DetectorEnsemble:
             )
         self.threshold_percentile = threshold_percentile
         self.detectors: list[tuple[str, AnomalyDetector, float]] = []
+        self.detector_types_: dict[str, DetectorType] = {}
         self.train_scores_: dict[str, np.ndarray] | None = None
         self.threshold_: float | None = None
 
     def add_detector(
-        self, name: str, detector: AnomalyDetector, weight: float = 1.0
+        self,
+        name: str,
+        detector: AnomalyDetector,
+        weight: float = 1.0,
+        detector_type: DetectorType = DetectorType.UNSUPERVISED,
     ) -> None:
         """Add a detector to the ensemble.
 
@@ -88,6 +111,7 @@ class DetectorEnsemble:
             name: Unique identifier for this detector.
             detector: An AnomalyDetector instance (unfitted is fine).
             weight: Relative weight in the ensemble combination.
+            detector_type: Whether the detector is unsupervised or supervised.
         """
         if weight <= 0:
             raise ValueError(f"Weight must be positive, got {weight}")
@@ -95,20 +119,41 @@ class DetectorEnsemble:
         if name in existing_names:
             raise ValueError(f"Detector name '{name}' already exists in ensemble")
         self.detectors.append((name, detector, weight))
+        self.detector_types_[name] = detector_type
 
     def fit(
-        self, X_train: np.ndarray, X_val: np.ndarray
+        self,
+        X_train: np.ndarray,
+        X_val: np.ndarray,
+        X_train_jailbreak: np.ndarray | None = None,
+        X_val_jailbreak: np.ndarray | None = None,
+        threshold_method: str | None = None,
     ) -> DetectorEnsemble:
         """Fit all detectors and calibrate the ensemble threshold.
 
-        1. Fits each detector on X_train (benign-only).
-        2. Scores X_train with each detector and stores for normalization.
-        3. Scores X_val through the full ensemble pipeline.
-        4. Sets the threshold at the configured percentile of val scores.
+        Unsupervised detectors are fitted on X_train (benign-only).
+        Supervised detectors are fitted on X_train + X_train_jailbreak with labels.
+        All detectors are normalized against benign training scores.
+
+        Threshold calibration:
+            - If X_val_jailbreak is provided (and threshold_method != "percentile"):
+              uses supervised calibration (Youden's J by default).
+            - Otherwise: uses percentile of benign validation ensemble scores.
 
         Args:
-            X_train: Normal/benign activations for training, (n_train, n_features).
-            X_val: Normal/benign activations for threshold calibration.
+            X_train: Benign activations for training, (n_train, n_features).
+            X_val: Benign activations for threshold calibration.
+            X_train_jailbreak: Jailbreak activations for supervised detectors.
+                Required if any detector has detector_type=SUPERVISED.
+            X_val_jailbreak: Jailbreak activations for supervised threshold
+                calibration. When provided, enables Youden's J / F1 thresholding.
+            threshold_method: Override threshold calibration method.
+                None = auto ("youden" if labeled val data, else "percentile").
+                "percentile" = percentile on benign val scores.
+                "youden" = maximize TPR - FPR (Youden's J statistic).
+                "f1" = maximize F1 score.
+                "fpr_target" = find threshold for target FPR derived from
+                    threshold_percentile (e.g. 95% → 5% FPR).
 
         Returns:
             self, for method chaining.
@@ -121,11 +166,34 @@ class DetectorEnsemble:
 
         self.train_scores_ = {}
 
-        # 1. Fit each detector and store training scores for normalization
+        # 1. Fit each detector based on its type
         for name, detector, weight in self.detectors:
-            logger.info("Fitting detector '%s' (weight=%.1f)...", name, weight)
-            detector.fit(X_train)
+            dtype = self.detector_types_.get(name, DetectorType.UNSUPERVISED)
+            logger.info(
+                "Fitting detector '%s' (weight=%.1f, type=%s)...",
+                name,
+                weight,
+                dtype.value,
+            )
 
+            if dtype == DetectorType.UNSUPERVISED:
+                detector.fit(X_train)
+            elif dtype == DetectorType.SUPERVISED:
+                if X_train_jailbreak is None:
+                    raise ValueError(
+                        f"Detector '{name}' is supervised but no jailbreak "
+                        f"training data was provided (X_train_jailbreak=None)."
+                    )
+                X_combined = np.vstack([X_train, X_train_jailbreak])
+                y_combined = np.concatenate([
+                    np.zeros(len(X_train), dtype=np.int64),
+                    np.ones(len(X_train_jailbreak), dtype=np.int64),
+                ])
+                detector.fit(X_combined, y_combined)
+
+            # Normalize against benign training scores for all detectors.
+            # This ensures consistent interpretation: "what fraction of
+            # normal training scores does this score exceed?"
             raw_train = detector.score(X_train)
             self.train_scores_[name] = np.sort(raw_train)
 
@@ -137,23 +205,115 @@ class DetectorEnsemble:
                 raw_train.max(),
             )
 
-        # 2. Score validation set through the full pipeline
-        val_result = self.score(X_val)
-        val_scores = val_result.ensemble_scores
-
-        # 3. Set threshold at configured percentile
-        self.threshold_ = float(np.percentile(val_scores, self.threshold_percentile))
-
-        logger.info(
-            "Ensemble threshold set at %.4f (%.1f%% percentile of val scores, "
-            "val_mean=%.4f, val_max=%.4f)",
-            self.threshold_,
-            self.threshold_percentile,
-            val_scores.mean(),
-            val_scores.max(),
+        # 2. Threshold calibration
+        use_supervised = (
+            X_val_jailbreak is not None
+            and threshold_method != "percentile"
         )
 
+        if use_supervised:
+            method = threshold_method or "youden"
+            val_benign_result = self.score(X_val)
+            val_jailbreak_result = self.score(X_val_jailbreak)
+
+            self.threshold_ = self._calibrate_threshold_supervised(
+                val_benign_result.ensemble_scores,
+                val_jailbreak_result.ensemble_scores,
+                method=method,
+            )
+
+            logger.info(
+                "Ensemble threshold set at %.4f (method=%s, "
+                "val_benign_mean=%.4f, val_jailbreak_mean=%.4f)",
+                self.threshold_,
+                method,
+                val_benign_result.ensemble_scores.mean(),
+                val_jailbreak_result.ensemble_scores.mean(),
+            )
+        else:
+            # Original unsupervised: percentile on benign val scores
+            val_result = self.score(X_val)
+            val_scores = val_result.ensemble_scores
+            self.threshold_ = float(
+                np.percentile(val_scores, self.threshold_percentile)
+            )
+
+            logger.info(
+                "Ensemble threshold set at %.4f (%.1f%% percentile of val "
+                "scores, val_mean=%.4f, val_max=%.4f)",
+                self.threshold_,
+                self.threshold_percentile,
+                val_scores.mean(),
+                val_scores.max(),
+            )
+
         return self
+
+    def _calibrate_threshold_supervised(
+        self,
+        scores_benign: np.ndarray,
+        scores_jailbreak: np.ndarray,
+        method: str = "youden",
+    ) -> float:
+        """Find optimal threshold using labeled validation data.
+
+        Args:
+            scores_benign: Ensemble scores for benign validation samples.
+            scores_jailbreak: Ensemble scores for jailbreak validation samples.
+            method: Calibration method — "youden", "f1", or "fpr_target".
+
+        Returns:
+            Optimal threshold value.
+        """
+        scores = np.concatenate([scores_benign, scores_jailbreak])
+        labels = np.concatenate([
+            np.zeros(len(scores_benign), dtype=np.int64),
+            np.ones(len(scores_jailbreak), dtype=np.int64),
+        ])
+
+        fpr, tpr, thresholds = roc_curve(labels, scores)
+
+        if method == "youden":
+            # Maximize TPR - FPR (Youden's J statistic)
+            j_stat = tpr - fpr
+            best_idx = int(np.argmax(j_stat))
+            threshold = float(thresholds[best_idx])
+
+        elif method == "f1":
+            # Maximize F1 score
+            n_pos = len(scores_jailbreak)
+            n_neg = len(scores_benign)
+            precision = tpr * n_pos / np.maximum(
+                tpr * n_pos + fpr * n_neg, 1e-10
+            )
+            recall = tpr
+            f1 = 2 * precision * recall / np.maximum(
+                precision + recall, 1e-10
+            )
+            best_idx = int(np.argmax(f1))
+            threshold = float(thresholds[best_idx])
+
+        elif method == "fpr_target":
+            # Find threshold for target FPR (derived from threshold_percentile)
+            target_fpr = 1.0 - self.threshold_percentile / 100.0
+            valid = np.where(fpr <= target_fpr)[0]
+            if len(valid) == 0:
+                threshold = float(thresholds[0])
+            else:
+                best_idx = int(valid[-1])
+                threshold = float(thresholds[best_idx])
+
+        else:
+            raise ValueError(
+                f"Unknown threshold method: {method!r}. "
+                f"Use 'youden', 'f1', or 'fpr_target'."
+            )
+
+        # sklearn's roc_curve assumes >= for classification, but our score()
+        # method uses > for thresholding. Nudge the threshold down by the
+        # smallest representable amount so that samples at the exact boundary
+        # are correctly classified as anomalous.
+        return float(np.nextafter(threshold, -np.inf))
 
     def score(self, X: np.ndarray) -> EnsembleResult:
         """Score data through the full ensemble pipeline.
@@ -213,6 +373,9 @@ class DetectorEnsemble:
         are on completely different scales. Percentile normalization puts them
         on a common scale before weighted combination.
 
+        All detectors are normalized against BENIGN training scores, ensuring
+        consistent interpretation regardless of detector type.
+
         Args:
             raw_scores: Raw detector scores to normalize.
             detector_name: Name of the detector (to look up training scores).
@@ -245,6 +408,9 @@ class DetectorEnsemble:
                 "name": name,
                 "weight": weight,
                 "type": type(detector).__name__,
+                "detector_type": self.detector_types_.get(
+                    name, DetectorType.UNSUPERVISED
+                ).value,
             })
 
         # Save training scores for normalization
@@ -283,12 +449,37 @@ class DetectorEnsemble:
         ensemble = cls(threshold_percentile=config["threshold_percentile"])
         ensemble.threshold_ = config["threshold"]
 
-        # Map type names to classes
+        # Map type names to classes — lazy imports for supervised detectors
+        # to avoid pulling in PyTorch/sklearn unless needed.
         _type_map: dict[str, type[AnomalyDetector]] = {
             "PCAMahalanobisDetector": PCAMahalanobisDetector,
             "IsolationForestDetector": IsolationForestDetector,
             "AutoencoderDetector": AutoencoderDetector,
         }
+
+        # Check if we need supervised detector classes
+        supervised_types = {
+            d["type"]
+            for d in config["detectors"]
+            if d["type"]
+            not in ("PCAMahalanobisDetector", "IsolationForestDetector", "AutoencoderDetector")
+        }
+        if supervised_types:
+            from venator.detection.contrastive import (
+                ContrastiveDirectionDetector,
+                ContrastiveMahalanobisDetector,
+            )
+            from venator.detection.linear_probe import (
+                LinearProbeDetector,
+                MLPProbeDetector,
+            )
+
+            _type_map.update({
+                "LinearProbeDetector": LinearProbeDetector,
+                "MLPProbeDetector": MLPProbeDetector,
+                "ContrastiveDirectionDetector": ContrastiveDirectionDetector,
+                "ContrastiveMahalanobisDetector": ContrastiveMahalanobisDetector,
+            })
 
         for det_info in config["detectors"]:
             name = det_info["name"]
@@ -302,6 +493,10 @@ class DetectorEnsemble:
             detector = det_cls.load(path / name)
             ensemble.detectors.append((name, detector, weight))
 
+            # Restore detector type (default to UNSUPERVISED for legacy saves)
+            dtype_str = det_info.get("detector_type", "unsupervised")
+            ensemble.detector_types_[name] = DetectorType(dtype_str)
+
         # Load training scores
         train_scores_path = path / "train_scores.npz"
         if train_scores_path.exists():
@@ -312,10 +507,15 @@ class DetectorEnsemble:
         return ensemble
 
 
+# ---------------------------------------------------------------------------
+# Factory functions
+# ---------------------------------------------------------------------------
+
+
 def create_default_ensemble(
     threshold_percentile: float = 95.0,
 ) -> DetectorEnsemble:
-    """Create the recommended ensemble configuration.
+    """Create the recommended unsupervised ensemble configuration.
 
     Weights from ELK paper findings:
     - PCA+Mahalanobis: 2.0 (primary detector, 0.94+ AUROC)
@@ -329,7 +529,117 @@ def create_default_ensemble(
         An unfitted DetectorEnsemble with the default detector configuration.
     """
     ensemble = DetectorEnsemble(threshold_percentile=threshold_percentile)
-    ensemble.add_detector("pca_mahalanobis", PCAMahalanobisDetector(), weight=2.0)
-    ensemble.add_detector("isolation_forest", IsolationForestDetector(), weight=1.5)
-    ensemble.add_detector("autoencoder", AutoencoderDetector(), weight=1.0)
+    ensemble.add_detector(
+        "pca_mahalanobis",
+        PCAMahalanobisDetector(),
+        weight=2.0,
+        detector_type=DetectorType.UNSUPERVISED,
+    )
+    ensemble.add_detector(
+        "isolation_forest",
+        IsolationForestDetector(),
+        weight=1.5,
+        detector_type=DetectorType.UNSUPERVISED,
+    )
+    ensemble.add_detector(
+        "autoencoder",
+        AutoencoderDetector(),
+        weight=1.0,
+        detector_type=DetectorType.UNSUPERVISED,
+    )
+    return ensemble
+
+
+def create_unsupervised_ensemble(
+    threshold_percentile: float = 95.0,
+) -> DetectorEnsemble:
+    """Create an unsupervised-only ensemble (for baseline comparison).
+
+    Same as create_default_ensemble — provided for API symmetry with
+    create_supervised_ensemble and create_hybrid_ensemble.
+    """
+    return create_default_ensemble(threshold_percentile=threshold_percentile)
+
+
+def create_supervised_ensemble(
+    threshold_percentile: float = 95.0,
+) -> DetectorEnsemble:
+    """Create a supervised ensemble using labeled jailbreak data.
+
+    Uses detectors from Anthropic's "Cheap Monitors" paper and the
+    ELK paper's diff-in-means approach. Requires labeled jailbreak data
+    for training.
+
+    Args:
+        threshold_percentile: Fallback percentile if no labeled val data.
+
+    Returns:
+        An unfitted DetectorEnsemble with supervised detectors.
+    """
+    from venator.detection.contrastive import (
+        ContrastiveDirectionDetector,
+        ContrastiveMahalanobisDetector,
+    )
+    from venator.detection.linear_probe import LinearProbeDetector
+
+    ensemble = DetectorEnsemble(threshold_percentile=threshold_percentile)
+    ensemble.add_detector(
+        "linear_probe",
+        LinearProbeDetector(),
+        weight=2.5,
+        detector_type=DetectorType.SUPERVISED,
+    )
+    ensemble.add_detector(
+        "contrastive_direction",
+        ContrastiveDirectionDetector(),
+        weight=2.0,
+        detector_type=DetectorType.SUPERVISED,
+    )
+    ensemble.add_detector(
+        "contrastive_mahalanobis",
+        ContrastiveMahalanobisDetector(),
+        weight=1.5,
+        detector_type=DetectorType.SUPERVISED,
+    )
+    return ensemble
+
+
+def create_hybrid_ensemble(
+    threshold_percentile: float = 95.0,
+) -> DetectorEnsemble:
+    """Create a hybrid ensemble: supervised detectors + unsupervised autoencoder.
+
+    Best of both: supervised detectors (for accuracy on known attack patterns)
+    plus the unsupervised autoencoder (for catching novel attacks not in
+    the training jailbreaks). Requires labeled jailbreak data for the
+    supervised detectors.
+
+    Args:
+        threshold_percentile: Fallback percentile if no labeled val data.
+
+    Returns:
+        An unfitted DetectorEnsemble with mixed detector types.
+    """
+    from venator.detection.contrastive import ContrastiveDirectionDetector
+    from venator.detection.linear_probe import LinearProbeDetector
+
+    ensemble = DetectorEnsemble(threshold_percentile=threshold_percentile)
+    ensemble.add_detector(
+        "linear_probe",
+        LinearProbeDetector(),
+        weight=2.5,
+        detector_type=DetectorType.SUPERVISED,
+    )
+    ensemble.add_detector(
+        "contrastive_direction",
+        ContrastiveDirectionDetector(),
+        weight=2.0,
+        detector_type=DetectorType.SUPERVISED,
+    )
+    ensemble.add_detector(
+        "autoencoder",
+        AutoencoderDetector(),
+        weight=1.0,
+        detector_type=DetectorType.UNSUPERVISED,
+    )
     return ensemble
