@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime
+import json
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go  # type: ignore[import-untyped]
@@ -10,6 +12,7 @@ import streamlit as st
 
 from venator.dashboard.components.charts import score_gauge
 from venator.dashboard.state import PipelineState
+from venator.detection.ensemble import DetectorType
 
 state = PipelineState()
 
@@ -26,6 +29,20 @@ st.markdown(
 if not state.is_stage_available(6):
     st.warning("Complete the **Train** stage first to unlock detection.")
     st.stop()
+
+# ------------------------------------------------------------------
+# Ensemble info from pipeline metadata
+# ------------------------------------------------------------------
+
+_ensemble_type = "unsupervised"
+
+meta_path = Path(state.model_path) / "pipeline_meta.json"
+if meta_path.exists():
+    with open(meta_path, "r", encoding="utf-8") as _f:
+        _meta = json.load(_f)
+    _ensemble_type = _meta.get("ensemble_type", "unsupervised")
+
+st.caption(f"Ensemble type: **{_ensemble_type}**")
 
 # ------------------------------------------------------------------
 # Quick-fill example prompts
@@ -120,17 +137,34 @@ if st.button("Detect", type="primary", disabled=not prompt):
     det_names = list(detector_scores.keys())
     det_values = list(detector_scores.values())
 
+    # Get detector type labels from the cached pipeline's ensemble
+    pipeline = st.session_state["_detect_pipeline"]
+    det_type_map = pipeline.ensemble.detector_types_
+
+    # Color by detector type: green=supervised, blue=unsupervised, red=above threshold
+    bar_colors = []
+    for name, v in zip(det_names, det_values):
+        if v > result["threshold"]:
+            bar_colors.append("rgba(219, 64, 82, 0.8)")  # red for anomalous
+        elif det_type_map.get(name) == DetectorType.SUPERVISED:
+            bar_colors.append("rgba(44, 160, 101, 0.8)")  # green for supervised
+        else:
+            bar_colors.append("rgba(55, 128, 191, 0.8)")  # blue for unsupervised
+
+    # Build display names with type tags
+    det_display_names = []
+    for name in det_names:
+        det_type = det_type_map.get(name, DetectorType.UNSUPERVISED)
+        tag = "sup" if det_type == DetectorType.SUPERVISED else "unsup"
+        det_display_names.append(f"{name} [{tag}]")
+
     fig = go.Figure(
         data=[
             go.Bar(
                 x=det_values,
-                y=det_names,
+                y=det_display_names,
                 orientation="h",
-                marker_color=[
-                    "rgba(219, 64, 82, 0.8)" if v > result["threshold"]
-                    else "rgba(55, 128, 191, 0.8)"
-                    for v in det_values
-                ],
+                marker_color=bar_colors,
                 text=[f"{v:.4f}" for v in det_values],
                 textposition="outside",
             )
@@ -146,11 +180,18 @@ if st.button("Detect", type="primary", disabled=not prompt):
     fig.update_layout(
         title="Per-Detector Scores",
         xaxis_title="Normalized Score",
-        height=200,
-        margin=dict(t=40, b=40, l=120, r=40),
+        height=max(200, 50 * len(det_names)),
+        margin=dict(t=40, b=40, l=160, r=40),
         xaxis=dict(range=[0, max(1.05, max(det_values) * 1.1)]),
     )
     st.plotly_chart(fig, width="stretch")
+
+    if _ensemble_type != "unsupervised":
+        st.caption(
+            "Colors: :blue[unsupervised detectors], "
+            ":green[supervised detectors], "
+            ":red[above threshold]"
+        )
 
     # --- Append to session history ---
     if "_detect_history" not in st.session_state:
@@ -186,5 +227,13 @@ if history:
 
     df = pd.DataFrame(list(reversed(history)))
     st.dataframe(df, use_container_width=True, height=300)
+
+    # Download session history
+    st.download_button(
+        "Download Session History (JSON)",
+        data=json.dumps(history, indent=2),
+        file_name="detect_session_history.json",
+        mime="application/json",
+    )
 else:
     st.info("No prompts analyzed yet. Enter a prompt above to get started.")

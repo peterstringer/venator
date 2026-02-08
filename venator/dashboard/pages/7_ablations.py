@@ -188,24 +188,42 @@ def _show_ablation_results(results: dict) -> None:
         with tabs[tab_idx]:
             det_data = results["detectors"]
             det_names = [r["detector"] for r in det_data]
+            det_types = [r.get("type", "unsup") for r in det_data]
             aurocs = [r["auroc"] for r in det_data]
             auprcs = [r.get("auprc", 0) for r in det_data]
+
+            # Display names with type tags
+            det_display_names = [
+                f"{n} [{t}]" for n, t in zip(det_names, det_types)
+            ]
+
+            # Color AUROC bars by detector type
+            auroc_colors = [
+                "rgba(44, 160, 101, 0.8)" if t == "sup"
+                else "rgba(55, 128, 191, 0.8)"
+                for t in det_types
+            ]
+            auprc_colors = [
+                "rgba(44, 160, 101, 0.5)" if t == "sup"
+                else "rgba(55, 128, 191, 0.5)"
+                for t in det_types
+            ]
 
             # Grouped bar chart
             fig = go.Figure()
             fig.add_trace(go.Bar(
                 name="AUROC",
-                x=det_names,
+                x=det_display_names,
                 y=aurocs,
-                marker_color="rgba(55, 128, 191, 0.8)",
+                marker_color=auroc_colors,
                 text=[f"{v:.3f}" for v in aurocs],
                 textposition="outside",
             ))
             fig.add_trace(go.Bar(
                 name="AUPRC",
-                x=det_names,
+                x=det_display_names,
                 y=auprcs,
-                marker_color="rgba(44, 160, 101, 0.8)",
+                marker_color=auprc_colors,
                 text=[f"{v:.3f}" for v in auprcs],
                 textposition="outside",
             ))
@@ -214,10 +232,17 @@ def _show_ablation_results(results: dict) -> None:
                 title="Detector Performance Comparison",
                 yaxis_title="Score",
                 height=400,
-                margin=dict(t=40, b=40, l=40, r=20),
+                margin=dict(t=40, b=80, l=40, r=20),
                 template="plotly_white",
             )
             st.plotly_chart(fig, width="stretch")
+
+            has_sup = any(t == "sup" for t in det_types)
+            if has_sup:
+                st.caption(
+                    "Colors: :blue[unsupervised detectors], "
+                    ":green[supervised detectors]"
+                )
 
             # Correlation heatmap
             if "detector_sample_scores" in results:
@@ -240,7 +265,7 @@ def _show_ablation_results(results: dict) -> None:
 
             df = pd.DataFrame(det_data)
             display_cols = [
-                "detector", "auroc", "auprc", "precision", "recall", "f1", "time_s",
+                "detector", "type", "auroc", "auprc", "precision", "recall", "f1", "time_s",
             ]
             display_cols = [c for c in display_cols if c in df.columns]
             st.dataframe(
@@ -423,7 +448,9 @@ if st.button("Run Ablations", type="primary"):
     if run_pca:
         total_configs += len(_ABLATION_PCA_DIMS)
     if run_detectors:
-        total_configs += 4  # 3 individual + 1 ensemble
+        total_configs += 4  # 3 unsupervised individual + 1 ensemble
+        if is_semi:
+            total_configs += 3  # 3 supervised individual detectors
     if run_label_efficiency:
         total_configs += len(_LABEL_BUDGETS)
     if run_cross_source:
@@ -514,27 +541,63 @@ if st.button("Run Ablations", type="primary"):
         X_train, X_val = _get_train_val(store, splits, base_layer)
         X_test, labels = _get_test_data(store, splits, base_layer)
 
-        detector_configs = [
-            ("pca_mahalanobis", PCAMahalanobisDetector(n_components=config.pca_dims)),
-            ("isolation_forest", IsolationForestDetector(n_components=config.pca_dims)),
-            ("autoencoder", AutoencoderDetector(n_components=config.pca_dims)),
+        # Get jailbreak data if semi-supervised
+        X_train_jb = None
+        X_val_jb = None
+        if is_semi:
+            X_train_jb = store.get_activations(
+                base_layer, indices=splits["train_jailbreak"].indices.tolist()
+            )
+            X_val_jb = store.get_activations(
+                base_layer, indices=splits["val_jailbreak"].indices.tolist()
+            )
+
+        # Unsupervised detectors
+        detector_configs: list[tuple[str, object, str]] = [
+            ("pca_mahalanobis", PCAMahalanobisDetector(n_components=config.pca_dims), "unsup"),
+            ("isolation_forest", IsolationForestDetector(n_components=config.pca_dims), "unsup"),
+            ("autoencoder", AutoencoderDetector(n_components=config.pca_dims), "unsup"),
         ]
+
+        # Add supervised detectors when semi-supervised splits are available
+        if is_semi:
+            from venator.detection.contrastive import (
+                ContrastiveDirectionDetector,
+                ContrastiveMahalanobisDetector,
+            )
+            from venator.detection.linear_probe import LinearProbeDetector
+
+            detector_configs.extend([
+                ("linear_probe", LinearProbeDetector(), "sup"),
+                ("contrastive_direction", ContrastiveDirectionDetector(), "sup"),
+                ("contrastive_mahalanobis", ContrastiveMahalanobisDetector(), "sup"),
+            ])
 
         detector_results = []
         detector_sample_scores: dict[str, list] = {}
 
-        for name, detector in detector_configs:
+        for name, detector, det_type_label in detector_configs:
             progress.progress(
                 current / total_configs,
-                text=f"Detector ablation: {name}...",
+                text=f"Detector ablation: {name} ({det_type_label})...",
             )
 
             t0 = time.perf_counter()
             ens = DetectorEnsemble(
                 threshold_percentile=config.anomaly_threshold_percentile,
             )
-            ens.add_detector(name, detector, weight=1.0)
-            ens.fit(X_train, X_val)
+            det_type = (
+                DetectorType.SUPERVISED if det_type_label == "sup"
+                else DetectorType.UNSUPERVISED
+            )
+            ens.add_detector(name, detector, weight=1.0, detector_type=det_type)
+
+            if det_type_label == "sup" and X_train_jb is not None:
+                ens.fit(X_train, X_val,
+                        X_train_jailbreak=X_train_jb,
+                        X_val_jailbreak=X_val_jb)
+            else:
+                ens.fit(X_train, X_val)
 
             result = ens.score(X_test)
             metrics = evaluate_detector(
@@ -543,15 +606,16 @@ if st.button("Run Ablations", type="primary"):
 
             elapsed = time.perf_counter() - t0
             detector_results.append({
-                "detector": name, "time_s": round(elapsed, 2), **metrics,
+                "detector": name, "type": det_type_label,
+                "time_s": round(elapsed, 2), **metrics,
             })
             detector_sample_scores[name] = result.ensemble_scores.tolist()
             current += 1
 
-        # Full ensemble
+        # Full ensemble (unsupervised)
         progress.progress(
             current / total_configs,
-            text="Detector ablation: full ensemble...",
+            text="Detector ablation: full unsupervised ensemble...",
         )
 
         t0 = time.perf_counter()
@@ -567,9 +631,10 @@ if st.button("Run Ablations", type="primary"):
 
         elapsed = time.perf_counter() - t0
         detector_results.append({
-            "detector": "ensemble", "time_s": round(elapsed, 2), **metrics,
+            "detector": "ensemble (unsup)", "type": "unsup",
+            "time_s": round(elapsed, 2), **metrics,
         })
-        detector_sample_scores["ensemble"] = result.ensemble_scores.tolist()
+        detector_sample_scores["ensemble (unsup)"] = result.ensemble_scores.tolist()
         current += 1
 
         results["detectors"] = detector_results

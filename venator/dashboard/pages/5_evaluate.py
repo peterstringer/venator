@@ -259,6 +259,28 @@ if state.evaluation_ready and state.eval_results:
                     st.metric(key.upper(), f"{metrics[key]:.4f}")
         st.info("Re-run evaluation to see full visualizations and prompt explorer.")
 
+    # --- Download results ---
+    st.divider()
+    _export_eval_data = eval_data if eval_data is not None else {"metrics": state.eval_results}
+    _export_safe = {
+        k: v for k, v in _export_eval_data.items()
+        if k not in ("prompts",)  # exclude large prompt lists
+    }
+    json_str = json.dumps(_export_safe, indent=2, default=str)
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            "Download Evaluation Results (JSON)",
+            data=json_str,
+            file_name="evaluation_results.json",
+            mime="application/json",
+        )
+    with dl_col2:
+        st.info(
+            "Use the camera icon in the top-right corner of each chart to "
+            "download individual figures as PNG."
+        )
+
     col_re, col_cont = st.columns(2)
     with col_re:
         if st.button("Re-evaluate"):
@@ -442,6 +464,21 @@ if st.button("Run Evaluation", type="primary"):
 
     # Show results
     _show_results(eval_data)
+
+    # Download results
+    st.divider()
+    _export_safe = {
+        k: v for k, v in eval_data.items()
+        if k not in ("prompts",)
+    }
+    json_str = json.dumps(_export_safe, indent=2, default=str)
+    st.download_button(
+        "Download Evaluation Results (JSON)",
+        data=json_str,
+        file_name="evaluation_results.json",
+        mime="application/json",
+        key="post_eval_download",
+    )
 
     if st.button("Continue to Detect  \u2192", type="primary", key="post_eval_continue"):
         st.switch_page("pages/6_detect.py")
