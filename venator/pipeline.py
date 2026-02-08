@@ -204,14 +204,22 @@ class VenatorPipeline:
         self,
         store: ActivationStore,
         splits: dict[str, DataSplit],
+        ensemble_type: str = "auto",
     ) -> dict[str, float]:
         """Train the ensemble and calibrate the threshold.
 
-        Automatically detects the split mode from the split keys:
-        - Unsupervised (keys: "train", "val"): fits on benign data only.
-        - Semi-supervised (keys: "train_benign", "train_jailbreak", ...):
-          passes labeled jailbreak data to supervised detectors and enables
-          supervised threshold calibration.
+        Automatically detects the split mode from the split keys and routes
+        data to the appropriate detectors. The ``ensemble_type`` parameter
+        provides explicit control over whether labeled jailbreak data is passed
+        to the ensemble:
+
+        - ``"auto"`` (default): pass jailbreak data if semi-supervised splits
+          are detected (has ``"train_benign"`` key).
+        - ``"unsupervised"``: ignore jailbreak splits even if present — passes
+          only benign data (useful for baseline comparison).
+        - ``"supervised"`` or ``"hybrid"``: require semi-supervised splits and
+          pass jailbreak data to the ensemble's ``fit()`` method. The ensemble
+          itself routes data based on each detector's ``DetectorType``.
 
         Args:
             store: ActivationStore with extracted activations.
@@ -219,14 +227,22 @@ class VenatorPipeline:
                 (``"train"``/``"val"``) or semi-supervised
                 (``"train_benign"``/``"val_benign"``/``"train_jailbreak"``/
                 ``"val_jailbreak"``).
+            ensemble_type: One of ``"auto"``, ``"unsupervised"``,
+                ``"supervised"``, ``"hybrid"``. Controls data routing.
 
         Returns:
             Dict with ``"val_false_positive_rate"`` — the fraction of benign
             validation samples flagged as anomalous by the calibrated threshold.
         """
-        # Detect split mode from keys
+        valid_types = {"auto", "unsupervised", "supervised", "hybrid"}
+        if ensemble_type not in valid_types:
+            raise ValueError(
+                f"ensemble_type must be one of {valid_types}, got {ensemble_type!r}"
+            )
+
+        # --- Extract training/validation data from splits ---
         if "train" in splits:
-            # Unsupervised mode
+            # Unsupervised splits
             X_train = store.get_activations(
                 self.layer, indices=splits["train"].indices.tolist()
             )
@@ -235,20 +251,37 @@ class VenatorPipeline:
             )
             X_train_jailbreak = None
             X_val_jailbreak = None
+
+            if ensemble_type in ("supervised", "hybrid"):
+                raise ValueError(
+                    f"ensemble_type={ensemble_type!r} requires semi-supervised "
+                    "splits (keys: 'train_benign', 'train_jailbreak', ...). "
+                    "Got unsupervised splits. Use SplitMode.SEMI_SUPERVISED "
+                    "when creating splits."
+                )
+
         elif "train_benign" in splits:
-            # Semi-supervised mode
+            # Semi-supervised splits
             X_train = store.get_activations(
                 self.layer, indices=splits["train_benign"].indices.tolist()
             )
             X_val = store.get_activations(
                 self.layer, indices=splits["val_benign"].indices.tolist()
             )
-            X_train_jailbreak = store.get_activations(
-                self.layer, indices=splits["train_jailbreak"].indices.tolist()
-            )
-            X_val_jailbreak = store.get_activations(
-                self.layer, indices=splits["val_jailbreak"].indices.tolist()
-            )
+
+            # Pass jailbreak data unless explicitly unsupervised
+            if ensemble_type == "unsupervised":
+                X_train_jailbreak = None
+                X_val_jailbreak = None
+            else:
+                X_train_jailbreak = store.get_activations(
+                    self.layer,
+                    indices=splits["train_jailbreak"].indices.tolist(),
+                )
+                X_val_jailbreak = store.get_activations(
+                    self.layer,
+                    indices=splits["val_jailbreak"].indices.tolist(),
+                )
         else:
             raise ValueError(
                 f"Unrecognized split keys: {set(splits.keys())}. "
@@ -257,7 +290,8 @@ class VenatorPipeline:
             )
 
         logger.info(
-            "Training ensemble: layer=%d, n_train=%d, n_val=%d%s",
+            "Training ensemble (type=%s): layer=%d, n_train=%d, n_val=%d%s",
+            ensemble_type,
             self.layer,
             len(X_train),
             len(X_val),
@@ -291,13 +325,18 @@ class VenatorPipeline:
     ) -> dict[str, float]:
         """Evaluate the trained ensemble on the test set (benign + jailbreak).
 
+        Returns ensemble-level metrics plus a full per-detector breakdown
+        (AUROC, AUPRC, F1@threshold) for comparing individual detectors
+        and identifying which contribute most to ensemble performance.
+
         Args:
             store: ActivationStore with extracted activations.
             splits: Must contain ``"test_benign"`` and ``"test_jailbreak"`` keys.
 
         Returns:
-            Dict with AUROC, AUPRC, precision, recall, F1, per-detector AUROC,
-            and other metrics from ``evaluate_detector``.
+            Dict with ensemble AUROC, AUPRC, precision, recall, F1,
+            per-detector metrics (``auroc_<name>``, ``auprc_<name>``,
+            ``f1_<name>``), and other metrics from ``evaluate_detector``.
         """
         X_test_benign = store.get_activations(
             self.layer, indices=splits["test_benign"].indices.tolist()
@@ -317,10 +356,16 @@ class VenatorPipeline:
             result.ensemble_scores, labels, threshold=self.ensemble.threshold_
         )
 
-        # Per-detector AUROC
+        # Per-detector metrics: AUROC, AUPRC, and F1@threshold
         for det_result in result.detector_results:
-            det_metrics = evaluate_detector(det_result.normalized_scores, labels)
+            det_metrics = evaluate_detector(
+                det_result.normalized_scores, labels,
+                threshold=self.ensemble.threshold_,
+            )
             metrics[f"auroc_{det_result.name}"] = det_metrics["auroc"]
+            metrics[f"auprc_{det_result.name}"] = det_metrics["auprc"]
+            if "f1" in det_metrics:
+                metrics[f"f1_{det_result.name}"] = det_metrics["f1"]
 
         logger.info(
             "Evaluation: AUROC=%.4f, AUPRC=%.4f, FPR@95TPR=%.4f",

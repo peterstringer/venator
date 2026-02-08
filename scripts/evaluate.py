@@ -2,7 +2,8 @@
 """Full evaluation of trained detectors on test data (benign + jailbreak).
 
 Loads a trained ensemble, scores the test set, computes metrics (AUROC, AUPRC,
-precision, recall, F1), and reports per-detector breakdowns.
+precision, recall, F1), and reports a per-detector comparison table showing
+each detector's individual contribution.
 
 Usage:
     python scripts/evaluate.py \
@@ -32,7 +33,7 @@ import numpy as np
 
 from venator.activation.storage import ActivationStore
 from venator.data.splits import SplitManager
-from venator.detection.ensemble import DetectorEnsemble
+from venator.detection.ensemble import DetectorEnsemble, DetectorType
 from venator.detection.metrics import evaluate_detector
 
 logging.basicConfig(
@@ -40,6 +41,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _detector_type_label(ensemble: DetectorEnsemble, name: str) -> str:
+    """Get a human-readable type label for a detector."""
+    dtype = ensemble.detector_types_.get(name, DetectorType.UNSUPERVISED)
+    return "sup" if dtype == DetectorType.SUPERVISED else "unsup"
 
 
 def main() -> None:
@@ -87,19 +94,21 @@ def main() -> None:
     store = ActivationStore(args.store)
     splits = SplitManager.load_splits(args.splits)
 
-    # Read layer from pipeline metadata
+    # Read layer and ensemble type from pipeline metadata
     meta_path = args.model_dir / "pipeline_meta.json"
     if meta_path.exists():
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
         layer = meta["layer"]
+        ensemble_type = meta.get("ensemble_type", "unsupervised")
     else:
         # Fallback to middle of available layers
         available = store.layers
         layer = available[len(available) // 2]
+        ensemble_type = "unknown"
         logger.warning("No pipeline_meta.json found, using layer %d", layer)
 
-    logger.info("Evaluating on layer %d", layer)
+    logger.info("Evaluating on layer %d (ensemble_type=%s)", layer, ensemble_type)
 
     # Get test data
     X_test_benign = store.get_activations(
@@ -120,58 +129,90 @@ def main() -> None:
         len(X_test_benign), len(X_test_jailbreak), len(X_test),
     )
 
-    # Score and evaluate
+    # Score through ensemble
     result = ensemble.score(X_test)
-    metrics = evaluate_detector(
+
+    # Ensemble-level metrics
+    ensemble_metrics = evaluate_detector(
         result.ensemble_scores, labels, threshold=ensemble.threshold_
     )
 
-    # Per-detector AUROC
+    # Per-detector metrics
+    per_detector: list[dict[str, object]] = []
     for det_result in result.detector_results:
-        det_metrics = evaluate_detector(det_result.normalized_scores, labels)
-        metrics[f"auroc_{det_result.name}"] = det_metrics["auroc"]
+        det_metrics = evaluate_detector(
+            det_result.normalized_scores, labels, threshold=ensemble.threshold_
+        )
+        type_label = _detector_type_label(ensemble, det_result.name)
+        per_detector.append({
+            "name": det_result.name,
+            "type": type_label,
+            "weight": det_result.weight,
+            "auroc": det_metrics["auroc"],
+            "auprc": det_metrics["auprc"],
+            "f1": det_metrics.get("f1", 0.0),
+            "fpr_at_95_tpr": det_metrics["fpr_at_95_tpr"],
+        })
 
-    # Print results
-    print("\n" + "=" * 60)
-    print("Evaluation Results")
-    print("=" * 60)
-    print(f"  Layer:               {layer}")
-    print(f"  Test benign:         {len(X_test_benign)}")
-    print(f"  Test jailbreak:      {len(X_test_jailbreak)}")
-    print(f"  Threshold:           {ensemble.threshold_:.4f}")
+    # --- Print comparison table ---
+    print(f"\n{'=' * 75}")
+    print(f"Evaluation Results — {ensemble_type} ensemble, layer {layer}")
+    print(f"Test: {len(X_test_benign)} benign + {len(X_test_jailbreak)} jailbreak")
+    print(f"Threshold: {ensemble.threshold_:.4f}")
+    print(f"{'=' * 75}")
+
+    # Detector comparison table
+    header = f"  {'Detector':<30} | {'AUROC':>7} | {'AUPRC':>7} | {'F1':>7} | {'FPR@95':>7}"
+    separator = "  " + "-" * 71
+    print(header)
+    print(separator)
+
+    for det in per_detector:
+        label = f"{det['name']} ({det['type']})"
+        print(
+            f"  {label:<30} | {det['auroc']:>7.4f} | {det['auprc']:>7.4f} | "
+            f"{det['f1']:>7.4f} | {det['fpr_at_95_tpr']:>7.4f}"
+        )
+
+    print(separator)
+    print(
+        f"  {'Ensemble':<30} | {ensemble_metrics['auroc']:>7.4f} | "
+        f"{ensemble_metrics['auprc']:>7.4f} | "
+        f"{ensemble_metrics.get('f1', 0.0):>7.4f} | "
+        f"{ensemble_metrics['fpr_at_95_tpr']:>7.4f}"
+    )
+    print(f"{'=' * 75}")
+
+    # Additional ensemble metrics
+    print(f"\n  {'Metric':<30} | {'Value':>10}")
+    print("  " + "-" * 43)
+    extra_keys = ["precision", "recall", "accuracy", "true_positive_rate", "false_positive_rate"]
+    for key in extra_keys:
+        if key in ensemble_metrics:
+            print(f"  {key:<30} | {ensemble_metrics[key]:>10.4f}")
     print()
-
-    # Primary metrics
-    print(f"{'Metric':<30} | {'Value':>10}")
-    print("-" * 43)
-    primary_keys = ["auroc", "auprc", "fpr_at_95_tpr", "precision", "recall", "f1", "accuracy"]
-    for key in primary_keys:
-        if key in metrics:
-            print(f"  {key:<28} | {metrics[key]:>10.4f}")
-
-    # Per-detector AUROC
-    print()
-    print("Per-Detector AUROC:")
-    print("-" * 43)
-    for key in sorted(metrics.keys()):
-        if key.startswith("auroc_"):
-            det_name = key.replace("auroc_", "")
-            print(f"  {det_name:<28} | {metrics[key]:>10.4f}")
-    print("=" * 60)
 
     # Save JSON if requested
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        # Convert any numpy values to Python types for JSON serialization
-        json_metrics = {k: float(v) for k, v in metrics.items()}
-        json_metrics["layer"] = layer
-        json_metrics["n_test_benign"] = len(X_test_benign)
-        json_metrics["n_test_jailbreak"] = len(X_test_jailbreak)
-        json_metrics["threshold"] = float(ensemble.threshold_)
+
+        json_result = {
+            "layer": layer,
+            "ensemble_type": ensemble_type,
+            "n_test_benign": len(X_test_benign),
+            "n_test_jailbreak": len(X_test_jailbreak),
+            "threshold": float(ensemble.threshold_),
+            "ensemble_metrics": {k: float(v) for k, v in ensemble_metrics.items()},
+            "per_detector": [
+                {k: (float(v) if isinstance(v, (float, np.floating)) else v)
+                 for k, v in det.items()}
+                for det in per_detector
+            ],
+        }
 
         with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(json_metrics, f, indent=2)
-        print(f"\nSaved results to: {args.output}")
+            json.dump(json_result, f, indent=2)
+        print(f"Saved results to: {args.output}")
 
 
 if __name__ == "__main__":

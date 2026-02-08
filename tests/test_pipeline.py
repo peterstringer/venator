@@ -490,3 +490,98 @@ class TestSemiSupervisedTraining:
         pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
         with pytest.raises(ValueError, match="Unrecognized split keys"):
             pipeline.train(populated_store, bad_splits)
+
+
+# ===========================================================================
+# TestEnsembleTypeParam
+# ===========================================================================
+
+
+class TestEnsembleTypeParam:
+    """Test the ensemble_type parameter on pipeline.train()."""
+
+    @pytest.fixture
+    def semi_splits(self, populated_store):
+        manager = SplitManager(seed=SEED)
+        return manager.create_splits(populated_store, mode=SplitMode.SEMI_SUPERVISED)
+
+    def test_auto_with_unsupervised_splits(self, populated_store, splits):
+        """auto mode with unsupervised splits works (no jailbreak data passed)."""
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(populated_store, splits, ensemble_type="auto")
+        assert "val_false_positive_rate" in metrics
+
+    def test_auto_with_semi_supervised_splits(self, populated_store, semi_splits):
+        """auto mode with semi-supervised splits passes jailbreak data."""
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(populated_store, semi_splits, ensemble_type="auto")
+        assert "val_false_positive_rate" in metrics
+
+    def test_unsupervised_with_semi_splits_ignores_jailbreak(
+        self, populated_store, semi_splits,
+    ):
+        """ensemble_type='unsupervised' with semi splits ignores jailbreak data."""
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(
+            populated_store, semi_splits, ensemble_type="unsupervised",
+        )
+        assert "val_false_positive_rate" in metrics
+
+    def test_supervised_requires_semi_splits(self, populated_store, splits):
+        """ensemble_type='supervised' with unsupervised splits raises."""
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        with pytest.raises(ValueError, match="requires semi-supervised"):
+            pipeline.train(populated_store, splits, ensemble_type="supervised")
+
+    def test_hybrid_requires_semi_splits(self, populated_store, splits):
+        """ensemble_type='hybrid' with unsupervised splits raises."""
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        with pytest.raises(ValueError, match="requires semi-supervised"):
+            pipeline.train(populated_store, splits, ensemble_type="hybrid")
+
+    def test_hybrid_with_semi_splits(self, populated_store, semi_splits):
+        ensemble = create_hybrid_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        metrics = pipeline.train(
+            populated_store, semi_splits, ensemble_type="hybrid",
+        )
+        assert "val_false_positive_rate" in metrics
+
+    def test_invalid_ensemble_type_raises(self, populated_store, splits):
+        ensemble = create_default_ensemble()
+        pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
+        with pytest.raises(ValueError, match="ensemble_type"):
+            pipeline.train(populated_store, splits, ensemble_type="invalid")
+
+
+# ===========================================================================
+# TestEvaluatePerDetectorMetrics
+# ===========================================================================
+
+
+class TestEvaluatePerDetectorMetrics:
+    """Test that evaluate() returns per-detector AUPRC and F1."""
+
+    def test_returns_per_detector_auprc(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        assert "auprc_pca_mahalanobis" in metrics
+        assert "auprc_isolation_forest" in metrics
+        assert "auprc_autoencoder" in metrics
+
+    def test_returns_per_detector_f1(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        assert "f1_pca_mahalanobis" in metrics
+        assert "f1_isolation_forest" in metrics
+        assert "f1_autoencoder" in metrics
+
+    def test_per_detector_values_valid(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        for name in ("pca_mahalanobis", "isolation_forest", "autoencoder"):
+            assert 0.0 <= metrics[f"auroc_{name}"] <= 1.0
+            assert 0.0 <= metrics[f"auprc_{name}"] <= 1.0
+            assert 0.0 <= metrics[f"f1_{name}"] <= 1.0
