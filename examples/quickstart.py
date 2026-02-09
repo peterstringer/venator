@@ -2,10 +2,10 @@
 """Venator quickstart — detect jailbreaks from a pre-trained model.
 
 Usage:
-    python examples/quickstart.py --model-dir models/detector_v1/
+    python examples/quickstart.py --model-dir models/v2/
 
 This script loads a saved Venator pipeline and scores a few example prompts,
-printing the ensemble score, per-detector breakdown, and anomaly verdict.
+printing the score and jailbreak verdict for each.
 
 Prerequisites:
     1. Train a model via the Streamlit dashboard or CLI scripts.
@@ -50,24 +50,21 @@ def main(model_dir: str) -> None:
     print("Loading Venator pipeline...")
     pipeline = VenatorPipeline.load(model_path)
     print(f"  Layer: {pipeline.layer}")
-    print(f"  Threshold: {pipeline.ensemble.threshold_:.4f}")
-    print(f"  Detectors: {[d[0] for d in pipeline.ensemble._detectors]}")
+    print(f"  Primary detector: {pipeline.primary_name}")
+    print(f"  Threshold: {pipeline.primary_threshold:.4f}")
     print()
 
     print("=" * 70)
     for label, prompt in EXAMPLES:
         result = pipeline.detect(prompt)
 
-        verdict = "ANOMALY" if result["is_anomaly"] else "Normal"
-        icon = "!!" if result["is_anomaly"] else "ok"
+        verdict = "JAILBREAK" if result["is_jailbreak"] else "Normal"
+        icon = "!!" if result["is_jailbreak"] else "ok"
 
-        print(f"[{icon}] {verdict}  (score: {result['ensemble_score']:.4f}, "
+        print(f"[{icon}] {verdict}  (score: {result['score']:.4f}, "
               f"threshold: {result['threshold']:.4f})")
         print(f"    Expected: {label}")
         print(f"    Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
-        print(f"    Per-detector scores:")
-        for det_name, det_score in result["detector_scores"].items():
-            print(f"      {det_name}: {det_score:.4f}")
         print()
 
     print("=" * 70)
@@ -78,8 +75,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Venator quickstart")
     parser.add_argument(
         "--model-dir",
-        default="models/detector_v1",
-        help="Path to saved model directory (default: models/detector_v1)",
+        default="models/v2",
+        help="Path to saved model directory (default: models/v2)",
     )
     args = parser.parse_args()
     main(args.model_dir)
