@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import precision_recall_curve, roc_curve  # type: ignore[import-untyped]
@@ -234,11 +235,10 @@ def figure_detector_comparison(
                 fontweight="bold")
 
     # Legend
-    from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor=_COLOR_BAR_SUP, label="Supervised"),
-        Patch(facecolor=_COLOR_BAR_UNSUP, label="Unsupervised"),
-        Patch(facecolor=_COLOR_BAR_ENS, label="Ensemble"),
+        mpatches.Patch(facecolor=_COLOR_BAR_SUP, label="Supervised"),
+        mpatches.Patch(facecolor=_COLOR_BAR_UNSUP, label="Unsupervised"),
+        mpatches.Patch(facecolor=_COLOR_BAR_ENS, label="Ensemble"),
     ]
     ax.legend(handles=legend_elements, loc="lower right")
 
