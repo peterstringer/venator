@@ -21,24 +21,20 @@ logger = logging.getLogger(__name__)
 
 # Pipeline stage definitions: (number, key, display_name)
 STAGES = [
-    (1, "prompts_ready", "Data"),
-    (2, "activations_ready", "Extract"),
-    (3, "splits_ready", "Split"),
-    (4, "model_ready", "Train"),
-    (5, "evaluation_ready", "Evaluate"),
-    (6, "model_ready", "Detect"),  # same prerequisite as Evaluate
-    (7, "splits_ready", "Ablations"),  # needs activations + splits
+    (1, "model_ready", "Pipeline"),
+    (2, "evaluation_ready", "Results"),
+    (3, "evaluation_ready", "Explore"),
+    (4, "model_ready", "Live Detection"),
+    (5, "splits_ready", "Ablations"),
 ]
 
 # Prerequisites: stage_number -> list of state keys that must be True
 PREREQUISITES: dict[int, list[str]] = {
     1: [],
-    2: ["prompts_ready"],
-    3: ["activations_ready"],
-    4: ["splits_ready"],
-    5: ["model_ready"],
-    6: ["model_ready"],
-    7: ["activations_ready", "splits_ready"],
+    2: ["model_ready"],
+    3: ["model_ready", "evaluation_ready"],
+    4: ["model_ready"],
+    5: ["activations_ready", "splits_ready"],
 }
 
 
@@ -220,7 +216,7 @@ class PipelineState:
         """Check if a pipeline stage is available (prerequisites met).
 
         Args:
-            stage: Stage number (1-7).
+            stage: Stage number (1-5).
 
         Returns:
             True if all prerequisite flags are True.
@@ -229,17 +225,16 @@ class PipelineState:
         return all(bool(st.session_state.get(key, False)) for key in prereqs)
 
     def get_progress(self) -> list[tuple[str, bool]]:
-        """Get pipeline progress for sidebar display.
+        """Get pipeline sub-step progress for sidebar display.
 
         Returns:
-            List of (stage_name, is_complete) tuples for the 5 distinct stages.
+            List of (step_name, is_complete) tuples for the 4 pipeline steps.
         """
         return [
             ("Data", self.prompts_ready),
             ("Extract", self.activations_ready),
             ("Split", self.splits_ready),
             ("Train", self.model_ready),
-            ("Evaluate", self.evaluation_ready),
         ]
 
     def reset_from(self, stage: int) -> None:

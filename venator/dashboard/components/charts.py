@@ -38,6 +38,7 @@ def source_distribution_chart(
         showlegend=False,
         margin=dict(t=40, b=20, l=20, r=20),
         height=280,
+        template="plotly_white",
     )
     return fig
 
@@ -88,6 +89,7 @@ def score_distribution_chart(
         barmode="overlay",
         height=380,
         margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
     )
     return fig
 
@@ -151,6 +153,7 @@ def roc_curve_chart(
         margin=dict(t=40, b=40, l=40, r=20),
         xaxis=dict(range=[0, 1]),
         yaxis=dict(range=[0, 1.05]),
+        template="plotly_white",
     )
     return fig
 
@@ -188,6 +191,7 @@ def precision_recall_chart(
         margin=dict(t=40, b=40, l=40, r=20),
         xaxis=dict(range=[0, 1]),
         yaxis=dict(range=[0, 1.05]),
+        template="plotly_white",
     )
     return fig
 
@@ -229,6 +233,7 @@ def detector_comparison_chart(
         height=280,
         margin=dict(t=40, b=40, l=120, r=40),
         xaxis=dict(range=[0, 1.05]),
+        template="plotly_white",
     )
     return fig
 
@@ -275,6 +280,7 @@ def score_gauge(
     fig.update_layout(
         height=250,
         margin=dict(t=60, b=20, l=30, r=30),
+        template="plotly_white",
     )
     return fig
 

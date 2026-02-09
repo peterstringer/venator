@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go  # type: ignore[import-untyped]
 import streamlit as st
 
 from venator.dashboard.components.charts import score_gauge
@@ -15,7 +14,7 @@ from venator.dashboard.state import PipelineState
 
 state = PipelineState()
 
-st.header("6. Detect")
+st.header("Live Detection")
 st.markdown(
     "Run live single-prompt jailbreak detection using the primary detector. "
     "Enter a prompt and see whether it would be flagged as a jailbreak."
@@ -25,8 +24,8 @@ st.markdown(
 # Prerequisite check
 # ------------------------------------------------------------------
 
-if not state.is_stage_available(6):
-    st.warning("Complete the **Train** stage first to unlock detection.")
+if not state.is_stage_available(4):
+    st.warning("Complete the **Pipeline** (train) stage first to unlock detection.")
     st.stop()
 
 # ------------------------------------------------------------------
