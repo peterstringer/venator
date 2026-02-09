@@ -12,14 +12,13 @@ import streamlit as st
 
 from venator.dashboard.components.charts import score_gauge
 from venator.dashboard.state import PipelineState
-from venator.detection.ensemble import DetectorType
 
 state = PipelineState()
 
 st.header("6. Detect")
 st.markdown(
-    "Run live single-prompt jailbreak detection. Enter a prompt and see "
-    "whether it would be flagged as anomalous by the trained ensemble."
+    "Run live single-prompt jailbreak detection using the primary detector. "
+    "Enter a prompt and see whether it would be flagged as a jailbreak."
 )
 
 # ------------------------------------------------------------------
@@ -31,9 +30,10 @@ if not state.is_stage_available(6):
     st.stop()
 
 # ------------------------------------------------------------------
-# Ensemble info from pipeline metadata
+# Pipeline info from metadata
 # ------------------------------------------------------------------
 
+_primary_name = "unknown"
 _ensemble_type = "unsupervised"
 
 meta_path = Path(state.model_path) / "pipeline_meta.json"
@@ -41,8 +41,9 @@ if meta_path.exists():
     with open(meta_path, "r", encoding="utf-8") as _f:
         _meta = json.load(_f)
     _ensemble_type = _meta.get("ensemble_type", "unsupervised")
+    _primary_name = _meta.get("primary_name", "unknown")
 
-st.caption(f"Ensemble type: **{_ensemble_type}**")
+st.caption(f"Primary detector: **{_primary_name}** | Ensemble type: **{_ensemble_type}**")
 
 # ------------------------------------------------------------------
 # Quick-fill example prompts
@@ -121,77 +122,16 @@ if st.button("Detect", type="primary", disabled=not prompt):
     # --- Verdict + Gauge ---
     verdict_col, gauge_col = st.columns([3, 2])
     with verdict_col:
-        if result["is_anomaly"]:
-            st.error("ANOMALY DETECTED")
+        if result["is_jailbreak"]:
+            st.error("JAILBREAK DETECTED")
         else:
             st.success("Normal")
-        st.markdown(f"**Ensemble Score:** {result['ensemble_score']:.4f}")
+        st.markdown(f"**Score:** {result['score']:.4f}")
         st.markdown(f"**Threshold:** {result['threshold']:.4f}")
 
     with gauge_col:
-        fig = score_gauge(result["ensemble_score"], result["threshold"])
+        fig = score_gauge(result["score"], result["threshold"])
         st.plotly_chart(fig, width="stretch")
-
-    # --- Per-detector breakdown ---
-    detector_scores = result["detector_scores"]
-    det_names = list(detector_scores.keys())
-    det_values = list(detector_scores.values())
-
-    # Get detector type labels from the cached pipeline's ensemble
-    pipeline = st.session_state["_detect_pipeline"]
-    det_type_map = pipeline.ensemble.detector_types_
-
-    # Color by detector type: green=supervised, blue=unsupervised, red=above threshold
-    bar_colors = []
-    for name, v in zip(det_names, det_values):
-        if v > result["threshold"]:
-            bar_colors.append("rgba(219, 64, 82, 0.8)")  # red for anomalous
-        elif det_type_map.get(name) == DetectorType.SUPERVISED:
-            bar_colors.append("rgba(44, 160, 101, 0.8)")  # green for supervised
-        else:
-            bar_colors.append("rgba(55, 128, 191, 0.8)")  # blue for unsupervised
-
-    # Build display names with type tags
-    det_display_names = []
-    for name in det_names:
-        det_type = det_type_map.get(name, DetectorType.UNSUPERVISED)
-        tag = "sup" if det_type == DetectorType.SUPERVISED else "unsup"
-        det_display_names.append(f"{name} [{tag}]")
-
-    fig = go.Figure(
-        data=[
-            go.Bar(
-                x=det_values,
-                y=det_display_names,
-                orientation="h",
-                marker_color=bar_colors,
-                text=[f"{v:.4f}" for v in det_values],
-                textposition="outside",
-            )
-        ]
-    )
-    fig.add_vline(
-        x=result["threshold"],
-        line_dash="dash",
-        line_color="gray",
-        annotation_text=f"Threshold: {result['threshold']:.3f}",
-        annotation_position="top right",
-    )
-    fig.update_layout(
-        title="Per-Detector Scores",
-        xaxis_title="Normalized Score",
-        height=max(200, 50 * len(det_names)),
-        margin=dict(t=40, b=40, l=160, r=40),
-        xaxis=dict(range=[0, max(1.05, max(det_values) * 1.1)]),
-    )
-    st.plotly_chart(fig, width="stretch")
-
-    if _ensemble_type != "unsupervised":
-        st.caption(
-            "Colors: :blue[unsupervised detectors], "
-            ":green[supervised detectors], "
-            ":red[above threshold]"
-        )
 
     # --- Append to session history ---
     if "_detect_history" not in st.session_state:
@@ -199,8 +139,8 @@ if st.button("Detect", type="primary", disabled=not prompt):
 
     st.session_state["_detect_history"].append({
         "Prompt": prompt[:80] + "..." if len(prompt) > 80 else prompt,
-        "Score": round(result["ensemble_score"], 4),
-        "Verdict": "ANOMALY" if result["is_anomaly"] else "Normal",
+        "Score": round(result["score"], 4),
+        "Verdict": "JAILBREAK" if result["is_jailbreak"] else "Normal",
         "Time": datetime.datetime.now().strftime("%H:%M:%S"),
     })
 
@@ -214,16 +154,16 @@ st.subheader("Session History")
 history = st.session_state.get("_detect_history", [])
 if history:
     n_total = len(history)
-    n_anomaly = sum(1 for h in history if h["Verdict"] == "ANOMALY")
+    n_jailbreak = sum(1 for h in history if h["Verdict"] == "JAILBREAK")
 
     stat_col1, stat_col2, stat_col3 = st.columns(3)
     with stat_col1:
         st.metric("Total Scored", n_total)
     with stat_col2:
-        st.metric("Anomalies Detected", n_anomaly)
+        st.metric("Jailbreaks Detected", n_jailbreak)
     with stat_col3:
-        rate = n_anomaly / n_total * 100 if n_total > 0 else 0
-        st.metric("Anomaly Rate", f"{rate:.1f}%")
+        rate = n_jailbreak / n_total * 100 if n_total > 0 else 0
+        st.metric("Jailbreak Rate", f"{rate:.1f}%")
 
     df = pd.DataFrame(list(reversed(history)))
     st.dataframe(df, use_container_width=True, height=300)

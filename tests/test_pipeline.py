@@ -251,6 +251,16 @@ class TestTrain:
         pipeline.train(populated_store, splits)
         assert pipeline.ensemble.threshold_ is not None
 
+    def test_sets_primary_detector(self, mock_extractor, populated_store, splits):
+        ensemble = create_default_ensemble(threshold_percentile=95.0)
+        pipeline = VenatorPipeline(
+            ensemble=ensemble, layer=16, extractor=mock_extractor
+        )
+        pipeline.train(populated_store, splits)
+        assert pipeline.primary_name == "pca_mahalanobis"
+        assert pipeline.primary_threshold is not None
+        assert pipeline._primary_detector is not None
+
     def test_works_without_extractor(self, populated_store, splits):
         """Train and evaluate don't need an extractor."""
         ensemble = create_default_ensemble(threshold_percentile=95.0)
@@ -289,6 +299,30 @@ class TestEvaluate:
         assert "recall" in metrics
         assert "f1" in metrics
 
+    def test_returns_primary_section(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        assert "primary" in metrics
+        assert metrics["primary"]["detector"] == "pca_mahalanobis"
+        assert "auroc" in metrics["primary"]
+        assert "threshold" in metrics["primary"]
+
+    def test_returns_baselines_section(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        assert "baselines" in metrics
+        assert isinstance(metrics["baselines"], list)
+        # Should have the other 2 detectors (not primary)
+        assert len(metrics["baselines"]) == 2
+        baseline_names = {b["detector"] for b in metrics["baselines"]}
+        assert "isolation_forest" in baseline_names
+        assert "autoencoder" in baseline_names
+
+    def test_returns_retired_section(self, trained_pipeline, populated_store, splits):
+        metrics = trained_pipeline.evaluate(populated_store, splits)
+        assert "retired" in metrics
+        assert isinstance(metrics["retired"], list)
+        assert len(metrics["retired"]) == 1
+        assert metrics["retired"][0]["detector"] == "ensemble"
+
     def test_works_without_extractor(self, populated_store, splits):
         ensemble = create_default_ensemble(threshold_percentile=95.0)
         pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
@@ -305,26 +339,20 @@ class TestEvaluate:
 class TestDetect:
     def test_returns_expected_keys(self, trained_pipeline):
         result = trained_pipeline.detect("test prompt")
-        expected_keys = {"prompt", "ensemble_score", "is_anomaly", "threshold", "detector_scores"}
+        expected_keys = {"prompt", "score", "is_jailbreak", "threshold"}
         assert set(result.keys()) == expected_keys
 
-    def test_is_anomaly_is_python_bool(self, trained_pipeline):
+    def test_is_jailbreak_is_python_bool(self, trained_pipeline):
         result = trained_pipeline.detect("test prompt")
-        assert isinstance(result["is_anomaly"], bool)
+        assert isinstance(result["is_jailbreak"], bool)
 
-    def test_ensemble_score_is_python_float(self, trained_pipeline):
+    def test_score_is_python_float(self, trained_pipeline):
         result = trained_pipeline.detect("test prompt")
-        assert isinstance(result["ensemble_score"], float)
+        assert isinstance(result["score"], float)
 
     def test_prompt_echoed_back(self, trained_pipeline):
         result = trained_pipeline.detect("my test prompt")
         assert result["prompt"] == "my test prompt"
-
-    def test_detector_scores_has_all_detectors(self, trained_pipeline):
-        result = trained_pipeline.detect("test prompt")
-        assert "pca_mahalanobis" in result["detector_scores"]
-        assert "isolation_forest" in result["detector_scores"]
-        assert "autoencoder" in result["detector_scores"]
 
     def test_without_extractor_raises(self, populated_store, splits):
         ensemble = create_default_ensemble(threshold_percentile=95.0)
@@ -367,6 +395,8 @@ class TestSaveLoad:
             meta = json.load(f)
         assert meta["layer"] == 16
         assert meta["model_id"] == MODEL_ID
+        assert meta["primary_name"] == "pca_mahalanobis"
+        assert "primary_threshold" in meta
 
     def test_loaded_layer_matches(self, trained_pipeline, tmp_path):
         save_dir = tmp_path / "saved_model"
@@ -383,6 +413,17 @@ class TestSaveLoad:
         assert loaded.ensemble.threshold_ == pytest.approx(
             trained_pipeline.ensemble.threshold_
         )
+
+    def test_loaded_primary_matches(self, trained_pipeline, tmp_path):
+        save_dir = tmp_path / "saved_model"
+        trained_pipeline.save(save_dir)
+
+        loaded = VenatorPipeline.load(save_dir)
+        assert loaded.primary_name == trained_pipeline.primary_name
+        assert loaded.primary_threshold == pytest.approx(
+            trained_pipeline.primary_threshold
+        )
+        assert loaded._primary_detector is not None
 
     def test_save_without_extractor(self, populated_store, splits, tmp_path):
         """Saving without extractor should still save layer."""
@@ -445,8 +486,8 @@ class TestEndToEnd:
 
         # Detect
         result = pipeline.detect("some prompt")
-        assert "is_anomaly" in result
-        assert isinstance(result["is_anomaly"], bool)
+        assert "is_jailbreak" in result
+        assert isinstance(result["is_jailbreak"], bool)
 
 
 # ===========================================================================

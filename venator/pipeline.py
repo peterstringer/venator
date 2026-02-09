@@ -3,6 +3,11 @@
 Orchestrates the full workflow from raw prompts to detection results.
 Called by both CLI scripts and the Streamlit dashboard.
 
+The pipeline uses a **primary detector** pattern: after training, the single
+best detector (linear probe for semi-supervised, PCA+Mahalanobis for
+unsupervised) is used for all detection. The ensemble is retained only as
+a container for training all detectors and for comparison evaluation.
+
 Usage::
 
     # Full pipeline (with MLX model)
@@ -31,13 +36,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
+from sklearn.metrics import roc_curve  # type: ignore[import-untyped]
 
 from venator.activation.storage import ActivationStore
 from venator.config import VenatorConfig, config as default_config
 from venator.data.splits import DataSplit
 from venator.detection.autoencoder import AutoencoderDetector
+from venator.detection.base import AnomalyDetector
 from venator.detection.ensemble import (
     DetectorEnsemble,
+    DetectorType,
     EnsembleResult,
     create_default_ensemble,
 )
@@ -50,11 +58,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Priority order for selecting primary detector.
+# First match found in the ensemble becomes the primary.
+_PRIMARY_DETECTOR_PRIORITY = [
+    "linear_probe",
+    "pca_mahalanobis",
+    "contrastive_mahalanobis",
+    "isolation_forest",
+    "autoencoder",
+    "contrastive_direction",
+]
+
 
 class VenatorPipeline:
     """End-to-end jailbreak detection pipeline.
 
     Orchestrates: extract activations -> store -> train detectors -> evaluate -> detect.
+
+    After training, a single **primary detector** is selected for production
+    detection (``detect()``). The full ensemble of detectors is still available
+    for research comparison via ``evaluate()``.
 
     The ``extractor`` is optional — methods that don't require the MLX model
     (``train``, ``evaluate``, ``save``) work without one. Methods that do require
@@ -65,6 +88,8 @@ class VenatorPipeline:
         extractor: Activation extractor (MLX-based), or None for training-only use.
         ensemble: Detector ensemble (fitted or unfitted).
         layer: Primary transformer layer index used for detection.
+        primary_name: Name of the primary detector (set after train or load).
+        primary_threshold: Calibrated threshold for the primary detector.
     """
 
     def __init__(
@@ -76,6 +101,9 @@ class VenatorPipeline:
         self.extractor = extractor
         self.ensemble = ensemble
         self.layer = layer
+        self.primary_name: str | None = None
+        self.primary_threshold: float | None = None
+        self._primary_detector: AnomalyDetector | None = None
 
     @classmethod
     def from_config(cls, config: VenatorConfig | None = None) -> VenatorPipeline:
@@ -307,11 +335,20 @@ class VenatorPipeline:
             X_val_jailbreak=X_val_jailbreak,
         )
 
-        # Compute validation false positive rate (benign val only)
-        val_result = self.ensemble.score(X_val)
-        val_fpr = float(np.mean(val_result.is_anomaly))
+        # --- Select and calibrate primary detector ---
+        self._select_primary_detector()
+        self._calibrate_primary_threshold(
+            X_val, X_val_jailbreak=X_val_jailbreak,
+        )
 
-        logger.info("Validation FPR: %.4f (threshold=%.4f)", val_fpr, self.ensemble.threshold_)
+        # Compute validation false positive rate (benign val only, primary detector)
+        primary_val_scores = self._primary_detector.score(X_val)
+        val_fpr = float(np.mean(primary_val_scores > self.primary_threshold))
+
+        logger.info(
+            "Primary detector: %s (threshold=%.4f, val_fpr=%.4f)",
+            self.primary_name, self.primary_threshold, val_fpr,
+        )
         return {"val_false_positive_rate": val_fpr}
 
     # ------------------------------------------------------------------
@@ -322,21 +359,28 @@ class VenatorPipeline:
         self,
         store: ActivationStore,
         splits: dict[str, DataSplit],
-    ) -> dict[str, float]:
-        """Evaluate the trained ensemble on the test set (benign + jailbreak).
+    ) -> dict[str, Any]:
+        """Evaluate detectors on the test set (benign + jailbreak).
 
-        Returns ensemble-level metrics plus a full per-detector breakdown
-        (AUROC, AUPRC, F1@threshold) for comparing individual detectors
-        and identifying which contribute most to ensemble performance.
+        Returns structured output with the **primary detector** metrics at
+        the top level, plus a comparison of all individual detectors and the
+        (now retired) ensemble.
+
+        The return dict has:
+            - Top-level metrics (``auroc``, ``auprc``, ``precision``, etc.)
+              from the primary detector.
+            - ``"primary"``: dict with primary detector name and metrics.
+            - ``"baselines"``: list of dicts for other individual detectors.
+            - ``"retired"``: list with the ensemble result (for comparison).
+            - ``"per_detector"``: flat dict mapping ``auroc_<name>`` etc.
+              for backwards compatibility.
 
         Args:
             store: ActivationStore with extracted activations.
             splits: Must contain ``"test_benign"`` and ``"test_jailbreak"`` keys.
 
         Returns:
-            Dict with ensemble AUROC, AUPRC, precision, recall, F1,
-            per-detector metrics (``auroc_<name>``, ``auprc_<name>``,
-            ``f1_<name>``), and other metrics from ``evaluate_detector``.
+            Structured evaluation dict.
         """
         X_test_benign = store.get_activations(
             self.layer, indices=splits["test_benign"].indices.tolist()
@@ -351,27 +395,85 @@ class VenatorPipeline:
             np.ones(len(X_test_jailbreak), dtype=np.int64),
         ])
 
+        # Score through ensemble (runs all detectors)
         result = self.ensemble.score(X_test)
-        metrics = evaluate_detector(
-            result.ensemble_scores, labels, threshold=self.ensemble.threshold_
+
+        # --- Primary detector metrics (top-level) ---
+        primary_scores = self._primary_detector.score(X_test)
+        primary_metrics = evaluate_detector(
+            primary_scores, labels, threshold=self.primary_threshold,
         )
 
-        # Per-detector metrics: AUROC, AUPRC, and F1@threshold
+        # --- Per-detector metrics ---
+        baselines = []
+        per_detector_flat: dict[str, float] = {}
         for det_result in result.detector_results:
             det_metrics = evaluate_detector(
                 det_result.normalized_scores, labels,
                 threshold=self.ensemble.threshold_,
             )
-            metrics[f"auroc_{det_result.name}"] = det_metrics["auroc"]
-            metrics[f"auprc_{det_result.name}"] = det_metrics["auprc"]
+            det_type = self.ensemble.detector_types_.get(
+                det_result.name, DetectorType.UNSUPERVISED
+            )
+            type_label = "sup" if det_type == DetectorType.SUPERVISED else "unsup"
+
+            entry = {
+                "detector": det_result.name,
+                "type": type_label,
+                "auroc": det_metrics["auroc"],
+                "auprc": det_metrics["auprc"],
+                "f1": det_metrics.get("f1", 0.0),
+                "fpr_at_95_tpr": det_metrics["fpr_at_95_tpr"],
+            }
+
+            # Skip the primary — it's reported separately
+            if det_result.name != self.primary_name:
+                baselines.append(entry)
+
+            # Flat keys for backwards compat
+            per_detector_flat[f"auroc_{det_result.name}"] = det_metrics["auroc"]
+            per_detector_flat[f"auprc_{det_result.name}"] = det_metrics["auprc"]
             if "f1" in det_metrics:
-                metrics[f"f1_{det_result.name}"] = det_metrics["f1"]
+                per_detector_flat[f"f1_{det_result.name}"] = det_metrics["f1"]
+
+        # Sort baselines by AUROC descending
+        baselines.sort(key=lambda d: d["auroc"], reverse=True)
+
+        # --- Ensemble as retired ---
+        ensemble_metrics = evaluate_detector(
+            result.ensemble_scores, labels, threshold=self.ensemble.threshold_
+        )
+        retired = [{
+            "detector": "ensemble",
+            "auroc": ensemble_metrics["auroc"],
+            "auprc": ensemble_metrics["auprc"],
+            "f1": ensemble_metrics.get("f1", 0.0),
+            "fpr_at_95_tpr": ensemble_metrics["fpr_at_95_tpr"],
+            "note": "worse than primary" if ensemble_metrics["auroc"] < primary_metrics["auroc"] else "comparable to primary",
+        }]
+
+        # Build the structured result
+        metrics: dict[str, Any] = {
+            # Top-level = primary detector metrics (backwards compat)
+            **{k: v for k, v in primary_metrics.items()},
+            # Structured comparison
+            "primary": {
+                "detector": self.primary_name,
+                "threshold": self.primary_threshold,
+                **{k: v for k, v in primary_metrics.items()},
+            },
+            "baselines": baselines,
+            "retired": retired,
+            # Flat per-detector keys for backwards compat
+            **per_detector_flat,
+        }
 
         logger.info(
-            "Evaluation: AUROC=%.4f, AUPRC=%.4f, FPR@95TPR=%.4f",
-            metrics["auroc"],
-            metrics["auprc"],
-            metrics["fpr_at_95_tpr"],
+            "Evaluation (primary=%s): AUROC=%.4f, AUPRC=%.4f, FPR@95TPR=%.4f",
+            self.primary_name,
+            primary_metrics["auroc"],
+            primary_metrics["auprc"],
+            primary_metrics["fpr_at_95_tpr"],
         )
         return metrics
 
@@ -382,15 +484,18 @@ class VenatorPipeline:
     def detect(self, prompt: str) -> dict[str, Any]:
         """Score a single prompt for jailbreak detection.
 
+        Uses only the primary detector (not the full ensemble) for fast,
+        accurate inference. The score is the primary detector's raw output
+        (e.g., P(jailbreak) for the linear probe).
+
         Args:
             prompt: The text to analyze.
 
         Returns:
-            Dict with keys: ``prompt``, ``ensemble_score``, ``is_anomaly``,
-            ``threshold``, ``detector_scores``.
+            Dict with keys: ``prompt``, ``score``, ``is_jailbreak``, ``threshold``.
 
         Raises:
-            RuntimeError: If no extractor is available, or ensemble is not fitted.
+            RuntimeError: If no extractor is available, or pipeline is not fitted.
         """
         if self.extractor is None:
             raise RuntimeError(
@@ -398,19 +503,20 @@ class VenatorPipeline:
                 "to the constructor."
             )
 
+        if self._primary_detector is None or self.primary_threshold is None:
+            raise RuntimeError(
+                "Pipeline has not been trained. Call train() first."
+            )
+
         activations = self.extractor.extract_single(prompt)
         X = activations[self.layer].reshape(1, -1)
-        result = self.ensemble.score(X)
+        score = float(self._primary_detector.score(X)[0])
 
         return {
             "prompt": prompt,
-            "ensemble_score": float(result.ensemble_scores[0]),
-            "is_anomaly": bool(result.is_anomaly[0]),
-            "threshold": result.threshold,
-            "detector_scores": {
-                det.name: float(det.normalized_scores[0])
-                for det in result.detector_results
-            },
+            "score": score,
+            "is_jailbreak": bool(score > self.primary_threshold),
+            "threshold": float(self.primary_threshold),
         }
 
     # ------------------------------------------------------------------
@@ -421,7 +527,7 @@ class VenatorPipeline:
         """Save the trained ensemble and pipeline metadata.
 
         Writes the ensemble files and a ``pipeline_meta.json`` containing the
-        layer index and model information needed to reconstruct the pipeline.
+        layer index, primary detector info, and model information.
 
         Args:
             path: Directory to save into.
@@ -433,6 +539,10 @@ class VenatorPipeline:
         meta: dict[str, Any] = {
             "layer": self.layer,
         }
+        if self.primary_name is not None:
+            meta["primary_name"] = self.primary_name
+        if self.primary_threshold is not None:
+            meta["primary_threshold"] = self.primary_threshold
         if self.extractor is not None:
             meta["model_id"] = self.extractor._model_id
             meta["extraction_layers"] = sorted(self.extractor._target_layers)
@@ -448,9 +558,10 @@ class VenatorPipeline:
     ) -> VenatorPipeline:
         """Load a saved pipeline from disk.
 
-        Restores the ensemble and creates an extractor from the saved model_id
-        (or from the provided config). The MLX model is NOT loaded until the
-        first call to ``detect()`` or ``extract_and_store()``.
+        Restores the ensemble, primary detector metadata, and creates an
+        extractor from the saved model_id (or from the provided config).
+        The MLX model is NOT loaded until the first call to ``detect()``
+        or ``extract_and_store()``.
 
         Args:
             path: Directory containing the saved pipeline files.
@@ -473,6 +584,7 @@ class VenatorPipeline:
             model_id = meta.get("model_id", config.model_id)
             extraction_layers = meta.get("extraction_layers", config.extraction_layers)
         else:
+            meta = {}
             layer = config.extraction_layers[len(config.extraction_layers) // 2]
             model_id = config.model_id
             extraction_layers = config.extraction_layers
@@ -486,5 +598,114 @@ class VenatorPipeline:
             config=config,
         )
 
-        logger.info("Loaded VenatorPipeline from %s (layer=%d)", path, layer)
-        return cls(extractor=extractor, ensemble=ensemble, layer=layer)
+        pipeline = cls(extractor=extractor, ensemble=ensemble, layer=layer)
+
+        # Restore primary detector from metadata
+        primary_name = meta.get("primary_name")
+        primary_threshold = meta.get("primary_threshold")
+
+        if primary_name is not None and primary_threshold is not None:
+            # Locate the detector in the ensemble by name
+            for name, detector, _ in ensemble.detectors:
+                if name == primary_name:
+                    pipeline.primary_name = primary_name
+                    pipeline.primary_threshold = primary_threshold
+                    pipeline._primary_detector = detector
+                    break
+            else:
+                logger.warning(
+                    "Primary detector '%s' not found in ensemble, "
+                    "falling back to auto-selection",
+                    primary_name,
+                )
+                pipeline._select_primary_detector()
+                # Use ensemble threshold as fallback
+                pipeline.primary_threshold = ensemble.threshold_
+        else:
+            # Legacy model without primary metadata — select automatically
+            # and use ensemble threshold as a fallback
+            pipeline._select_primary_detector()
+            pipeline.primary_threshold = ensemble.threshold_
+
+        logger.info(
+            "Loaded VenatorPipeline from %s (layer=%d, primary=%s)",
+            path, layer, pipeline.primary_name,
+        )
+        return pipeline
+
+    # ------------------------------------------------------------------
+    # Primary detector helpers
+    # ------------------------------------------------------------------
+
+    def _select_primary_detector(self) -> None:
+        """Select the primary detector from the ensemble by priority.
+
+        Sets ``primary_name`` and ``_primary_detector``. Does NOT set
+        ``primary_threshold`` — call ``_calibrate_primary_threshold``
+        separately.
+        """
+        detector_names = {name for name, _, _ in self.ensemble.detectors}
+
+        for candidate in _PRIMARY_DETECTOR_PRIORITY:
+            if candidate in detector_names:
+                for name, detector, _ in self.ensemble.detectors:
+                    if name == candidate:
+                        self.primary_name = name
+                        self._primary_detector = detector
+                        return
+
+        # Fallback: use the first detector
+        if self.ensemble.detectors:
+            name, detector, _ = self.ensemble.detectors[0]
+            self.primary_name = name
+            self._primary_detector = detector
+        else:
+            raise RuntimeError("Cannot select primary detector: ensemble has no detectors.")
+
+    def _calibrate_primary_threshold(
+        self,
+        X_val: np.ndarray,
+        X_val_jailbreak: np.ndarray | None = None,
+    ) -> None:
+        """Calibrate the primary detector's threshold.
+
+        With labeled validation data: uses Youden's J on raw primary scores.
+        Without labels: uses percentile on benign validation scores.
+
+        Args:
+            X_val: Benign validation activations.
+            X_val_jailbreak: Jailbreak validation activations (optional).
+        """
+        val_scores = self._primary_detector.score(X_val)
+
+        if X_val_jailbreak is not None and len(X_val_jailbreak) > 0:
+            # Supervised calibration via Youden's J on raw primary scores
+            jb_scores = self._primary_detector.score(X_val_jailbreak)
+            all_scores = np.concatenate([val_scores, jb_scores])
+            all_labels = np.concatenate([
+                np.zeros(len(val_scores), dtype=np.int64),
+                np.ones(len(jb_scores), dtype=np.int64),
+            ])
+
+            fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+            j_stat = tpr - fpr
+            best_idx = int(np.argmax(j_stat))
+            self.primary_threshold = float(np.nextafter(thresholds[best_idx], -np.inf))
+
+            logger.info(
+                "Primary threshold (Youden's J): %.4f "
+                "(val_benign_mean=%.4f, val_jb_mean=%.4f)",
+                self.primary_threshold,
+                val_scores.mean(),
+                jb_scores.mean(),
+            )
+        else:
+            # Unsupervised: percentile on benign validation scores
+            self.primary_threshold = float(
+                np.percentile(val_scores, self.ensemble.threshold_percentile)
+            )
+            logger.info(
+                "Primary threshold (%.1f%% percentile): %.4f",
+                self.ensemble.threshold_percentile,
+                self.primary_threshold,
+            )

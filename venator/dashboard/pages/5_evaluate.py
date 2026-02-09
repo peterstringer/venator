@@ -85,6 +85,11 @@ def _show_results(eval_data: dict) -> None:
 
     # --- Tab 1: Individual Detectors ---
     with tabs[tab_idx]:
+        # Primary detector info
+        primary_info = eval_data.get("primary_detector")
+        if primary_info:
+            st.caption(f"Primary detector: **{primary_info}**")
+
         # Headline Metrics
         st.subheader("Headline Metrics")
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -145,7 +150,7 @@ def _show_results(eval_data: dict) -> None:
             st.subheader("Per-Detector Breakdown")
             import pandas as pd
             df = pd.DataFrame(per_detector_info)
-            display_cols = [c for c in ["name", "type", "weight", "auroc", "auprc", "f1", "fpr_at_95_tpr"]
+            display_cols = [c for c in ["name", "tag", "type", "auroc", "auprc", "f1", "fpr_at_95_tpr"]
                            if c in df.columns]
             st.dataframe(df[display_cols].round(4), use_container_width=True, hide_index=True)
 
@@ -350,14 +355,45 @@ if st.button("Run Evaluation", type="primary"):
             f"{len(X_test_jailbreak)} jailbreak = {len(X_test)} total"
         )
 
-        # Score through primary ensemble
+        # --- Determine primary detector ---
+        primary_name = meta.get("primary_name") if meta_path.exists() else None
+        primary_threshold = meta.get("primary_threshold") if meta_path.exists() else None
+
+        _priority = ["linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
+                     "isolation_forest", "autoencoder", "contrastive_direction"]
+        det_names_in_ensemble = {n for n, _, _ in ensemble.detectors}
+        if primary_name is None or primary_name not in det_names_in_ensemble:
+            for candidate in _priority:
+                if candidate in det_names_in_ensemble:
+                    primary_name = candidate
+                    break
+
+        primary_det = None
+        for n, d, _ in ensemble.detectors:
+            if n == primary_name:
+                primary_det = d
+                break
+
+        # Score primary detector
+        if primary_det is not None:
+            primary_scores = primary_det.score(X_test)
+            if primary_threshold is not None:
+                metrics = evaluate_detector(primary_scores, labels, threshold=primary_threshold)
+            else:
+                metrics = evaluate_detector(primary_scores, labels, threshold=ensemble.threshold_)
+        else:
+            primary_scores = None
+            metrics = evaluate_detector(
+                ensemble.score(X_test).ensemble_scores, labels, threshold=ensemble.threshold_
+            )
+
+        # Score through ensemble (for comparison)
         result = ensemble.score(X_test)
-        metrics = evaluate_detector(
-            result.ensemble_scores, labels, threshold=ensemble.threshold_
-        )
 
         # Per-detector metrics
-        detector_aurocs = {"Ensemble": metrics["auroc"]}
+        detector_aurocs = {}
+        if primary_name:
+            detector_aurocs[f"{primary_name} (PRIMARY)"] = metrics["auroc"]
         per_detector_info = []
         for det_result in result.detector_results:
             det_metrics = evaluate_detector(
@@ -371,9 +407,11 @@ if st.button("Run Evaluation", type="primary"):
                 det_result.name, DetectorType.UNSUPERVISED
             ) == DetectorType.SUPERVISED else "unsup"
 
+            tag = "PRIMARY" if det_result.name == primary_name else "BASELINE"
             per_detector_info.append({
                 "name": det_result.name,
                 "type": det_type_label,
+                "tag": tag,
                 "weight": det_result.weight,
                 "auroc": det_metrics["auroc"],
                 "auprc": det_metrics["auprc"],
@@ -381,8 +419,28 @@ if st.button("Run Evaluation", type="primary"):
                 "fpr_at_95_tpr": det_metrics["fpr_at_95_tpr"],
             })
 
-        # Threshold curves for ROC/PR plotting
-        curves = compute_threshold_curves(result.ensemble_scores, labels)
+        # Add ensemble as RETIRED entry
+        ensemble_eval = evaluate_detector(
+            result.ensemble_scores, labels, threshold=ensemble.threshold_
+        )
+        per_detector_info.append({
+            "name": "ensemble",
+            "type": "ensemble",
+            "tag": "RETIRED",
+            "weight": 0.0,
+            "auroc": ensemble_eval["auroc"],
+            "auprc": ensemble_eval["auprc"],
+            "f1": ensemble_eval.get("f1", 0.0),
+            "fpr_at_95_tpr": ensemble_eval["fpr_at_95_tpr"],
+        })
+
+        # Sort: PRIMARY first, then BASELINE by AUROC desc, then RETIRED
+        _tag_order = {"PRIMARY": 0, "BASELINE": 1, "RETIRED": 2}
+        per_detector_info.sort(key=lambda d: (_tag_order.get(d["tag"], 9), -d["auroc"]))
+
+        # Use primary scores for ROC/PR curves
+        scores_for_curves = primary_scores if primary_scores is not None else result.ensemble_scores
+        curves = compute_threshold_curves(scores_for_curves, labels)
 
         # Get test prompts for explorer
         all_test_indices = test_benign_indices + test_jailbreak_indices
@@ -438,20 +496,28 @@ if st.button("Run Evaluation", type="primary"):
 
         status.update(label="Evaluation complete!", state="complete")
 
+    # Use primary scores for distribution display
+    display_scores = scores_for_curves
+    display_threshold = primary_threshold if primary_threshold is not None else ensemble.threshold_
+    display_predictions = (display_scores > display_threshold).astype(int)
+
     # Cache all display data in session state
     eval_data = {
-        "metrics": {k: float(v) for k, v in metrics.items()},
+        "metrics": {k: (float(v) if isinstance(v, (float, int, np.floating, np.integer)) else v)
+                    for k, v in metrics.items()
+                    if not isinstance(v, (list, dict))},
         "curves": {k: v.tolist() for k, v in curves.items()},
-        "benign_scores": result.ensemble_scores[:len(X_test_benign)].tolist(),
-        "jailbreak_scores": result.ensemble_scores[len(X_test_benign):].tolist(),
-        "threshold": float(ensemble.threshold_),
+        "benign_scores": display_scores[:len(X_test_benign)].tolist(),
+        "jailbreak_scores": display_scores[len(X_test_benign):].tolist(),
+        "threshold": float(display_threshold),
         "detector_aurocs": detector_aurocs,
         "per_detector_info": per_detector_info,
         "ensemble_type": ensemble_type,
+        "primary_detector": primary_name,
         "prompts": test_prompts,
         "labels": labels.tolist(),
-        "scores": result.ensemble_scores.tolist(),
-        "predictions": result.is_anomaly.astype(int).tolist(),
+        "scores": display_scores.tolist(),
+        "predictions": display_predictions.tolist(),
     }
     if ensemble_comparison:
         eval_data["ensemble_comparison"] = ensemble_comparison

@@ -180,6 +180,45 @@ def main() -> None:
     )
     elapsed = time.perf_counter() - t0
 
+    # --- Select primary detector ---
+    _priority = ["linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
+                 "isolation_forest", "autoencoder", "contrastive_direction"]
+    det_names = {n for n, _, _ in ensemble.detectors}
+    primary_name = None
+    primary_det = None
+    for candidate in _priority:
+        if candidate in det_names:
+            primary_name = candidate
+            for n, d, _ in ensemble.detectors:
+                if n == candidate:
+                    primary_det = d
+                    break
+            break
+    if primary_name is None:
+        primary_name = ensemble.detectors[0][0]
+        primary_det = ensemble.detectors[0][1]
+
+    # Calibrate primary threshold
+    from sklearn.metrics import roc_curve as _roc_curve  # type: ignore[import-untyped]
+
+    primary_val_scores = primary_det.score(X_val)
+    if X_val_jailbreak is not None and len(X_val_jailbreak) > 0:
+        primary_jb_scores = primary_det.score(X_val_jailbreak)
+        all_scores = np.concatenate([primary_val_scores, primary_jb_scores])
+        all_labels = np.concatenate([
+            np.zeros(len(primary_val_scores), dtype=np.int64),
+            np.ones(len(primary_jb_scores), dtype=np.int64),
+        ])
+        fpr_arr, tpr_arr, thresholds_arr = _roc_curve(all_labels, all_scores)
+        j_stat = tpr_arr - fpr_arr
+        best_idx = int(np.argmax(j_stat))
+        primary_threshold = float(np.nextafter(thresholds_arr[best_idx], -np.inf))
+    else:
+        primary_threshold = float(np.percentile(primary_val_scores, args.threshold_percentile))
+
+    # Compute primary val FPR
+    val_fpr = float(np.mean(primary_val_scores > primary_threshold))
+
     # Save ensemble
     output = Path(args.output)
     ensemble.save(output)
@@ -190,13 +229,11 @@ def main() -> None:
         "model_id": store.model_id,
         "extraction_layers": store.layers,
         "ensemble_type": args.ensemble_type,
+        "primary_name": primary_name,
+        "primary_threshold": primary_threshold,
     }
     with open(output / "pipeline_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-
-    # Compute validation FPR
-    val_result = ensemble.score(X_val)
-    val_fpr = float(np.mean(val_result.is_anomaly))
 
     # Summary
     print("\n" + "=" * 60)
@@ -205,6 +242,7 @@ def main() -> None:
     print(f"  Store:              {args.store}")
     print(f"  Ensemble type:      {args.ensemble_type}")
     print(f"  Detectors:          {', '.join(n for n, _, _ in ensemble.detectors)}")
+    print(f"  Primary detector:   {primary_name}")
     print(f"  Layer:              {args.layer}")
     print(f"  Training samples:   {len(X_train)} benign" + (
         f" + {len(X_train_jailbreak)} jailbreak" if X_train_jailbreak is not None else ""
@@ -212,9 +250,9 @@ def main() -> None:
     print(f"  Validation samples: {len(X_val)} benign" + (
         f" + {len(X_val_jailbreak)} jailbreak" if X_val_jailbreak is not None else ""
     ))
-    print(f"  Threshold pctile:   {args.threshold_percentile}")
-    print(f"  Threshold value:    {ensemble.threshold_:.4f}")
-    print(f"  Val FPR:            {val_fpr:.4f} ({val_fpr * 100:.1f}%)")
+    print(f"  Primary threshold:  {primary_threshold:.4f}")
+    print(f"  Ensemble threshold: {ensemble.threshold_:.4f}")
+    print(f"  Val FPR (primary):  {val_fpr:.4f} ({val_fpr * 100:.1f}%)")
     print(f"  Training time:      {elapsed:.1f}s")
     print(f"  Saved to:           {args.output}")
     print("=" * 60)

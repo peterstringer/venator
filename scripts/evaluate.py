@@ -129,10 +129,45 @@ def main() -> None:
         len(X_test_benign), len(X_test_jailbreak), len(X_test),
     )
 
-    # Score through ensemble
+    # --- Determine primary detector ---
+    # Priority: linear_probe > pca_mahalanobis > first available
+    primary_name = meta.get("primary_name") if meta_path.exists() else None
+    primary_threshold = meta.get("primary_threshold") if meta_path.exists() else None
+
+    _priority = ["linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
+                 "isolation_forest", "autoencoder", "contrastive_direction"]
+    det_names_in_ensemble = {n for n, _, _ in ensemble.detectors}
+    if primary_name is None or primary_name not in det_names_in_ensemble:
+        for candidate in _priority:
+            if candidate in det_names_in_ensemble:
+                primary_name = candidate
+                break
+        else:
+            primary_name = ensemble.detectors[0][0] if ensemble.detectors else "unknown"
+
+    # Score through ensemble (runs all detectors)
     result = ensemble.score(X_test)
 
-    # Ensemble-level metrics
+    # --- Primary detector metrics ---
+    primary_det = None
+    for name, det, _ in ensemble.detectors:
+        if name == primary_name:
+            primary_det = det
+            break
+
+    if primary_det is not None:
+        primary_scores = primary_det.score(X_test)
+        if primary_threshold is not None:
+            primary_metrics = evaluate_detector(primary_scores, labels, threshold=primary_threshold)
+        else:
+            primary_metrics = evaluate_detector(primary_scores, labels, threshold=ensemble.threshold_)
+            primary_threshold = ensemble.threshold_
+    else:
+        primary_metrics = evaluate_detector(
+            result.ensemble_scores, labels, threshold=ensemble.threshold_
+        )
+
+    # Ensemble-level metrics (for retired comparison)
     ensemble_metrics = evaluate_detector(
         result.ensemble_scores, labels, threshold=ensemble.threshold_
     )
@@ -154,42 +189,47 @@ def main() -> None:
             "fpr_at_95_tpr": det_metrics["fpr_at_95_tpr"],
         })
 
-    # --- Print comparison table ---
-    print(f"\n{'=' * 75}")
-    print(f"Evaluation Results — {ensemble_type} ensemble, layer {layer}")
-    print(f"Test: {len(X_test_benign)} benign + {len(X_test_jailbreak)} jailbreak")
-    print(f"Threshold: {ensemble.threshold_:.4f}")
-    print(f"{'=' * 75}")
+    # --- Print structured comparison ---
+    width = 75
+    print(f"\nDETECTOR COMPARISON (test set, {len(X_test_jailbreak)} jailbreaks never seen in training)")
+    print("=" * width)
 
-    # Detector comparison table
-    header = f"  {'Detector':<30} | {'AUROC':>7} | {'AUPRC':>7} | {'F1':>7} | {'FPR@95':>7}"
-    separator = "  " + "-" * 71
-    print(header)
-    print(separator)
+    # PRIMARY section
+    print(f"\n  PRIMARY:")
+    p_label = f"  {primary_name:<28}"
+    print(
+        f"  {p_label} AUROC: {primary_metrics['auroc']:.3f}   "
+        f"AUPRC: {primary_metrics['auprc']:.3f}"
+    )
 
-    for det in per_detector:
-        label = f"{det['name']} ({det['type']})"
+    # BASELINES section
+    print(f"\n  BASELINES:")
+    baselines = [d for d in per_detector if d["name"] != primary_name]
+    baselines.sort(key=lambda d: d["auroc"], reverse=True)
+    for det in baselines:
+        label = f"{det['name']}"
         print(
-            f"  {label:<30} | {det['auroc']:>7.4f} | {det['auprc']:>7.4f} | "
-            f"{det['f1']:>7.4f} | {det['fpr_at_95_tpr']:>7.4f}"
+            f"    {label:<26} AUROC: {det['auroc']:>5.3f}   "
+            f"AUPRC: {det['auprc']:>5.3f}  ({det['type']})"
         )
 
-    print(separator)
+    # RETIRED section
+    ens_note = "worse than primary" if ensemble_metrics["auroc"] < primary_metrics["auroc"] else "comparable"
+    print(f"\n  RETIRED:")
     print(
-        f"  {'Ensemble':<30} | {ensemble_metrics['auroc']:>7.4f} | "
-        f"{ensemble_metrics['auprc']:>7.4f} | "
-        f"{ensemble_metrics.get('f1', 0.0):>7.4f} | "
-        f"{ensemble_metrics['fpr_at_95_tpr']:>7.4f}"
+        f"    {'Ensemble (all detectors)':<26} AUROC: {ensemble_metrics['auroc']:>5.3f}   "
+        f"<- {ens_note}"
     )
-    print(f"{'=' * 75}")
 
-    # Additional ensemble metrics
+    print(f"\n{'=' * width}")
+
+    # Additional primary metrics
     print(f"\n  {'Metric':<30} | {'Value':>10}")
     print("  " + "-" * 43)
     extra_keys = ["precision", "recall", "accuracy", "true_positive_rate", "false_positive_rate"]
     for key in extra_keys:
-        if key in ensemble_metrics:
-            print(f"  {key:<30} | {ensemble_metrics[key]:>10.4f}")
+        if key in primary_metrics:
+            print(f"  {key:<30} | {primary_metrics[key]:>10.4f}")
     print()
 
     # Save JSON if requested
@@ -201,13 +241,26 @@ def main() -> None:
             "ensemble_type": ensemble_type,
             "n_test_benign": len(X_test_benign),
             "n_test_jailbreak": len(X_test_jailbreak),
-            "threshold": float(ensemble.threshold_),
-            "ensemble_metrics": {k: float(v) for k, v in ensemble_metrics.items()},
-            "per_detector": [
+            # Primary detector at top level
+            "primary": {
+                "detector": primary_name,
+                "threshold": float(primary_threshold),
+                **{k: float(v) for k, v in primary_metrics.items()},
+            },
+            "baselines": [
                 {k: (float(v) if isinstance(v, (float, np.floating)) else v)
                  for k, v in det.items()}
-                for det in per_detector
+                for det in baselines
             ],
+            "retired": [{
+                "detector": "ensemble",
+                "threshold": float(ensemble.threshold_),
+                **{k: float(v) for k, v in ensemble_metrics.items()},
+                "note": ens_note,
+            }],
+            # Top-level convenience keys
+            "auroc": float(primary_metrics["auroc"]),
+            "auprc": float(primary_metrics["auprc"]),
         }
 
         with open(args.output, "w", encoding="utf-8") as f:

@@ -363,9 +363,43 @@ if st.button("Train Ensemble", type="primary"):
         st.write(f"Training completed in {elapsed:.1f}s")
         status.update(label="Training complete!", state="complete")
 
-    # Compute validation FPR (benign-only)
-    val_result = ensemble.score(X_val)
-    val_fpr = float(np.mean(val_result.is_anomaly))
+    # --- Select primary detector ---
+    from sklearn.metrics import roc_curve as _roc_curve  # type: ignore[import-untyped]
+
+    _priority = ["linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
+                 "isolation_forest", "autoencoder", "contrastive_direction"]
+    det_names_in_ens = {n for n, _, _ in ensemble.detectors}
+    primary_name = None
+    primary_det = None
+    for candidate in _priority:
+        if candidate in det_names_in_ens:
+            primary_name = candidate
+            for n, d, _ in ensemble.detectors:
+                if n == candidate:
+                    primary_det = d
+                    break
+            break
+    if primary_name is None and ensemble.detectors:
+        primary_name = ensemble.detectors[0][0]
+        primary_det = ensemble.detectors[0][1]
+
+    # Calibrate primary threshold
+    primary_val_scores = primary_det.score(X_val)
+    if X_val_jailbreak is not None and len(X_val_jailbreak) > 0:
+        primary_jb_scores = primary_det.score(X_val_jailbreak)
+        all_scores = np.concatenate([primary_val_scores, primary_jb_scores])
+        all_labels = np.concatenate([
+            np.zeros(len(primary_val_scores), dtype=np.int64),
+            np.ones(len(primary_jb_scores), dtype=np.int64),
+        ])
+        fpr_arr, tpr_arr, thresholds_arr = _roc_curve(all_labels, all_scores)
+        j_stat = tpr_arr - fpr_arr
+        best_idx = int(np.argmax(j_stat))
+        primary_threshold = float(np.nextafter(thresholds_arr[best_idx], -np.inf))
+    else:
+        primary_threshold = float(np.percentile(primary_val_scores, threshold_pctile))
+
+    val_fpr = float(np.mean(primary_val_scores > primary_threshold))
 
     # Save model
     output_dir = config.models_dir / f"detector_{ensemble_type}_v1"
@@ -377,6 +411,8 @@ if st.button("Train Ensemble", type="primary"):
         "model_id": store.model_id,
         "extraction_layers": [int(l) for l in store.layers],
         "ensemble_type": ensemble_type,
+        "primary_name": primary_name,
+        "primary_threshold": primary_threshold,
     }
     with open(output_dir / "pipeline_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -384,11 +420,13 @@ if st.button("Train Ensemble", type="primary"):
     # Update state
     train_metrics = {
         "val_false_positive_rate": val_fpr,
-        "threshold": float(ensemble.threshold_),
+        "threshold": primary_threshold,
+        "ensemble_threshold": float(ensemble.threshold_),
         "layer": int(layer),
         "pca_dims": int(pca_dims),
         "n_detectors": int(n_detectors),
         "ensemble_type": ensemble_type,
+        "primary_detector": primary_name,
         "training_time_s": round(elapsed, 1),
     }
 
@@ -399,12 +437,13 @@ if st.button("Train Ensemble", type="primary"):
 
     # Show results
     st.success(f"Trained {ensemble_type} ensemble in {elapsed:.1f}s. Model saved to `{output_dir}`.")
+    st.info(f"Primary detector: **{primary_name}**")
 
     res_col1, res_col2, res_col3 = st.columns(3)
     with res_col1:
         st.metric("Validation FPR", f"{val_fpr:.4f} ({val_fpr * 100:.1f}%)")
     with res_col2:
-        st.metric("Threshold", f"{ensemble.threshold_:.4f}")
+        st.metric("Primary Threshold", f"{primary_threshold:.4f}")
     with res_col3:
         st.metric("Training time", f"{elapsed:.1f}s")
 
