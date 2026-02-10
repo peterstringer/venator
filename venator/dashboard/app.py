@@ -2,8 +2,9 @@
 
 Launch with: streamlit run venator/dashboard/app.py
 
-Provides a 5-page dashboard UI with status-embedded navigation.
-Navigation items show completion status directly in their titles:
+Provides a 6-page dashboard UI with status-embedded navigation.
+Quick Run is listed first as a standalone workflow; the remaining 5 pages
+form the detailed pipeline. Navigation items show completion status:
   ✅ = stage complete
   →  = available (prerequisites met, not yet done)
   🔒 = locked (prerequisites not met)
@@ -45,13 +46,19 @@ def _status_icon(page_key: str) -> str:
 
 
 # Build pages with dynamic status titles
-pages = [
-    st.Page("pages/1_pipeline.py", title=f"{_status_icon('pipeline')} Pipeline", url_path="pipeline"),
-    st.Page("pages/2_results.py", title=f"{_status_icon('results')} Results", url_path="results"),
-    st.Page("pages/3_explore.py", title=f"{_status_icon('explore')} Explore", url_path="explore"),
-    st.Page("pages/4_detect.py", title=f"{_status_icon('detect')} Live Detection", url_path="detect"),
-    st.Page("pages/5_ablations.py", title=f"{_status_icon('ablations')} Ablations", url_path="ablations"),
-]
+# Quick Run is a standalone workflow, listed separately before the detailed pages
+pages = {
+    "": [
+        st.Page("pages/quick_run.py", title="\u26a1 Quick Run", url_path="quick-run", default=True),
+    ],
+    "Pipeline": [
+        st.Page("pages/1_pipeline.py", title=f"{_status_icon('pipeline')} Pipeline", url_path="pipeline"),
+        st.Page("pages/2_results.py", title=f"{_status_icon('results')} Results", url_path="results"),
+        st.Page("pages/3_explore.py", title=f"{_status_icon('explore')} Explore", url_path="explore"),
+        st.Page("pages/4_detect.py", title=f"{_status_icon('detect')} Live Detection", url_path="detect"),
+        st.Page("pages/5_ablations.py", title=f"{_status_icon('ablations')} Ablations", url_path="ablations"),
+    ],
+}
 
 pg = st.navigation(pages)
 
