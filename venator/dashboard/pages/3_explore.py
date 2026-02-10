@@ -1,4 +1,8 @@
-"""Explore page — prompt-level deep dive with FP/FN analysis."""
+"""Explore page — prompt-level deep dive with FP/FN analysis.
+
+Respects the detector selector: FP/FN analysis uses whichever detector
+the user picks from the dropdown (defaults to the top-ranked detector).
+"""
 
 from __future__ import annotations
 
@@ -30,21 +34,42 @@ if not state.is_stage_available(3):
 
 eval_data = st.session_state.get("_eval_display_data")
 
-if eval_data is None:
+if eval_data is None or "detector_results" not in eval_data:
     st.info(
         "Evaluation display data not available. "
         "Go to the **Results** page and run evaluation first."
     )
     st.stop()
 
-# Extract arrays
+# ------------------------------------------------------------------
+# Detector selector
+# ------------------------------------------------------------------
+
+detector_results = eval_data["detector_results"]
 prompts = eval_data["prompts"]
 labels = np.array(eval_data["labels"])
-scores = np.array(eval_data["scores"])
-predictions = np.array(eval_data["predictions"])
-threshold = eval_data["threshold"]
 
+detector_options = {r["display_name"]: r for r in detector_results}
+
+selected_name = st.selectbox(
+    "Detector",
+    options=list(detector_options.keys()),
+    index=0,
+    key="explore_detector_select",
+)
+
+selected = detector_options[selected_name]
+
+# Derive scores and predictions from selected detector
+# Labels are ordered: benign first, jailbreak second — match the score order
+scores = np.array(selected["scores_benign"] + selected["scores_jailbreak"])
+threshold = selected["threshold"]
+predictions = (scores > threshold).astype(int)
+
+# ------------------------------------------------------------------
 # Summary stats
+# ------------------------------------------------------------------
+
 n_total = len(labels)
 n_jailbreak = int(labels.sum())
 n_benign = n_total - n_jailbreak
