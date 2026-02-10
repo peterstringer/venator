@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import streamlit as st
 
 from venator.activation.storage import ActivationStore
@@ -25,11 +24,14 @@ from venator.detection.autoencoder import AutoencoderDetector
 from venator.detection.ensemble import (
     DetectorEnsemble,
     DetectorType,
-    create_hybrid_ensemble,
-    create_supervised_ensemble,
-    create_unsupervised_ensemble,
+)
+from venator.detection.contrastive import (
+    ContrastiveDirectionDetector,
+    ContrastiveMahalanobisDetector,
 )
 from venator.detection.isolation_forest import IsolationForestDetector
+from venator.detection.linear_probe import LinearProbeDetector, MLPProbeDetector
+from venator.detection.metrics import evaluate_detector
 from venator.detection.pca_mahalanobis import PCAMahalanobisDetector
 
 state = PipelineState()
@@ -52,22 +54,78 @@ _JAILBREAK_SOURCES = {
     "Dan-style jailbreaks": "dan_style",
 }
 
-_ENSEMBLE_DETECTORS = {
-    "unsupervised": [
-        ("PCA + Mahalanobis", "unsup", 2.0),
-        ("Isolation Forest", "unsup", 1.5),
-        ("Autoencoder", "unsup", 1.0),
-    ],
-    "supervised": [
-        ("Linear Probe", "sup", 2.5),
-        ("Contrastive Direction", "sup", 2.0),
-        ("Contrastive Mahalanobis", "sup", 1.5),
-    ],
-    "hybrid": [
-        ("Linear Probe", "sup", 2.5),
-        ("Contrastive Direction", "sup", 2.0),
-        ("Autoencoder", "unsup", 1.0),
-    ],
+# Detector registry: (internal_name, display_name, type, default_weight, factory)
+# factory is a callable(pca_dims) -> detector instance
+_DETECTOR_REGISTRY = {
+    # Supervised
+    "linear_probe": {
+        "display": "Linear Probe",
+        "type": "supervised",
+        "default_weight": 2.5,
+        "factory": lambda pca, **kw: LinearProbeDetector(
+            n_components=pca, C=kw.get("C", 1.0),
+        ),
+    },
+    "contrastive_mahalanobis": {
+        "display": "Contrastive Mahalanobis",
+        "type": "supervised",
+        "default_weight": 1.5,
+        "factory": lambda pca, **kw: ContrastiveMahalanobisDetector(
+            n_components=pca, regularization=kw.get("regularization", 1e-5),
+        ),
+    },
+    "contrastive_direction": {
+        "display": "Contrastive Direction",
+        "type": "supervised",
+        "default_weight": 2.0,
+        "factory": lambda pca, **kw: ContrastiveDirectionDetector(),
+    },
+    "mlp_probe": {
+        "display": "MLP Probe",
+        "type": "supervised",
+        "default_weight": 2.0,
+        "factory": lambda pca, **kw: MLPProbeDetector(
+            n_components=pca,
+            hidden1=kw.get("hidden1", 128),
+            hidden2=kw.get("hidden2", 32),
+            epochs=kw.get("epochs", 200),
+        ),
+    },
+    # Unsupervised
+    "autoencoder": {
+        "display": "Autoencoder",
+        "type": "unsupervised",
+        "default_weight": 1.0,
+        "factory": lambda pca, **kw: AutoencoderDetector(
+            n_components=pca,
+            hidden_dim=kw.get("hidden_dim", 64),
+            epochs=kw.get("epochs", 200),
+        ),
+    },
+    "pca_mahalanobis": {
+        "display": "PCA + Mahalanobis",
+        "type": "unsupervised",
+        "default_weight": 2.0,
+        "factory": lambda pca, **kw: PCAMahalanobisDetector(
+            n_components=pca, regularization=kw.get("regularization", 1e-6),
+        ),
+    },
+    "isolation_forest": {
+        "display": "Isolation Forest",
+        "type": "unsupervised",
+        "default_weight": 1.5,
+        "factory": lambda pca, **kw: IsolationForestDetector(
+            n_components=pca, n_estimators=kw.get("n_estimators", 200),
+        ),
+    },
+}
+
+# Quick-select presets: name -> list of detector keys
+_QUICK_PRESETS = {
+    "Linear Probe Only": ["linear_probe"],
+    "All Supervised": ["linear_probe", "contrastive_mahalanobis", "contrastive_direction", "mlp_probe"],
+    "All Unsupervised": ["pca_mahalanobis", "isolation_forest", "autoencoder"],
+    "Everything": list(_DETECTOR_REGISTRY.keys()),
 }
 
 
@@ -644,68 +702,221 @@ with st.expander(_split_title, expanded=state.activations_ready and not state.sp
 # SECTION 4: Train Detectors
 # ==================================================================
 
+
+def _select_primary_detector(
+    ensemble: DetectorEnsemble,
+) -> tuple[str, object]:
+    """Select the primary detector from an ensemble by priority."""
+    _priority = [
+        "linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
+        "isolation_forest", "autoencoder", "contrastive_direction",
+        "mlp_probe",
+    ]
+    det_names_in_ens = {n for n, _, _ in ensemble.detectors}
+    for candidate in _priority:
+        if candidate in det_names_in_ens:
+            for n, d, _ in ensemble.detectors:
+                if n == candidate:
+                    return candidate, d
+    if ensemble.detectors:
+        return ensemble.detectors[0][0], ensemble.detectors[0][1]
+    raise RuntimeError("No detectors in ensemble")
+
+
+def _calibrate_primary_threshold(
+    primary_det: object,
+    X_val: np.ndarray,
+    X_val_jailbreak: np.ndarray | None,
+    threshold_pctile: float,
+) -> tuple[float, float]:
+    """Calibrate threshold for primary detector. Returns (threshold, val_fpr)."""
+    from sklearn.metrics import roc_curve as _roc_curve  # type: ignore[import-untyped]
+
+    primary_val_scores = primary_det.score(X_val)
+    if X_val_jailbreak is not None and len(X_val_jailbreak) > 0:
+        primary_jb_scores = primary_det.score(X_val_jailbreak)
+        all_scores = np.concatenate([primary_val_scores, primary_jb_scores])
+        all_labels = np.concatenate([
+            np.zeros(len(primary_val_scores), dtype=np.int64),
+            np.ones(len(primary_jb_scores), dtype=np.int64),
+        ])
+        fpr_arr, tpr_arr, thresholds_arr = _roc_curve(all_labels, all_scores)
+        j_stat = tpr_arr - fpr_arr
+        best_idx = int(np.argmax(j_stat))
+        threshold = float(np.nextafter(thresholds_arr[best_idx], -np.inf))
+    else:
+        threshold = float(np.percentile(primary_val_scores, threshold_pctile))
+    val_fpr = float(np.mean(primary_val_scores > threshold))
+    return threshold, val_fpr
+
+
+def _compute_detector_val_auroc(
+    det: object,
+    X_val: np.ndarray,
+    X_val_jailbreak: np.ndarray | None,
+) -> float | None:
+    """Compute AUROC for a single detector on validation data."""
+    if X_val_jailbreak is None or len(X_val_jailbreak) == 0:
+        return None
+    scores_b = det.score(X_val)
+    scores_j = det.score(X_val_jailbreak)
+    all_scores = np.concatenate([scores_b, scores_j])
+    all_labels = np.concatenate([
+        np.zeros(len(scores_b), dtype=np.int64),
+        np.ones(len(scores_j), dtype=np.int64),
+    ])
+    from sklearn.metrics import roc_auc_score  # type: ignore[import-untyped]
+    try:
+        return float(roc_auc_score(all_labels, all_scores))
+    except ValueError:
+        return None
+
+
 _train_title = ":white_check_mark: 4. Train Detectors" if state.model_ready else "4. Train Detectors"
 
 with st.expander(_train_title, expanded=state.splits_ready and not state.model_ready):
     if not state.splits_ready:
         st.info("Complete splitting first.")
     elif state.model_ready and state.model_path:
-        st.success("Model trained.")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Model directory", str(state.model_path))
-        with col2:
-            if state.train_metrics:
-                val_fpr = state.train_metrics.get("val_false_positive_rate")
-                if val_fpr is not None:
-                    st.metric("Validation FPR", f"{val_fpr:.4f} ({val_fpr * 100:.1f}%)")
+        # --- Completed state: show training summary banner ---
+        trained = state.trained_detectors or []
+        if trained:
+            st.success("Training Complete")
+            for det_info in trained:
+                auroc_str = f"Val AUROC: {det_info['val_auroc']:.3f}" if det_info.get("val_auroc") is not None else ""
+                primary_tag = " **[PRIMARY]**" if det_info.get("is_primary") else ""
+                st.markdown(
+                    f"- **{det_info['display']}**{primary_tag} — "
+                    f"Trained in {det_info['time_s']:.1f}s"
+                    + (f" ({auroc_str})" if auroc_str else "")
+                )
+        else:
+            st.success("Model trained.")
 
         if state.train_metrics:
-            primary = state.train_metrics.get("primary_detector")
-            if primary:
-                st.info(f"Primary detector: **{primary}**")
+            m = state.train_metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                val_fpr = m.get("val_false_positive_rate")
+                if val_fpr is not None:
+                    st.metric("Validation FPR", f"{val_fpr:.4f} ({val_fpr * 100:.1f}%)")
+            with col2:
+                primary = m.get("primary_detector")
+                if primary:
+                    st.metric("Primary Detector", primary)
+            with col3:
+                st.metric("Training Time", f"{m.get('training_time_s', 0):.1f}s")
 
-        if st.button("Re-train", key="re_train"):
-            state.reset_from(4)
-            st.rerun()
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("Re-train", key="re_train"):
+                state.reset_from(4)
+                st.rerun()
+        with btn_col2:
+            if st.button("View Results", type="primary", key="goto_results"):
+                st.switch_page("pages/2_results.py")
     else:
-        st.markdown(
-            "Train anomaly detection ensemble. Supports unsupervised, supervised, and hybrid."
-        )
+        # --- Training configuration ---
+        st.markdown("Select detectors, configure, and train.")
 
         splits = SplitManager.load_splits(state.splits_path)
         store = ActivationStore(state.store_path)
         available_layers = store.layers
-
-        # Determine if labeled jailbreaks are available for supervised training
         has_labeled_jailbreaks = splits["train_jailbreak"].n_samples > 0
 
-        # Ensemble type selector
+        # ---- SECTION 1: Detector Selection ----
+        st.markdown("**Detector Selection**")
+
+        # Quick-select buttons
+        preset_cols = st.columns(len(_QUICK_PRESETS))
+        for i, (preset_name, preset_keys) in enumerate(_QUICK_PRESETS.items()):
+            with preset_cols[i]:
+                # Filter supervised detectors if no jailbreaks
+                valid_keys = [
+                    k for k in preset_keys
+                    if has_labeled_jailbreaks or _DETECTOR_REGISTRY[k]["type"] == "unsupervised"
+                ]
+                if st.button(preset_name, key=f"preset_{i}", disabled=len(valid_keys) == 0):
+                    for k in _DETECTOR_REGISTRY:
+                        st.session_state[f"sel_{k}"] = k in valid_keys
+                    st.rerun()
+
+        # Supervised group
         if has_labeled_jailbreaks:
-            ensemble_type = st.radio(
-                "Ensemble Type",
-                options=["unsupervised", "supervised", "hybrid"],
-                format_func=lambda x: x.capitalize(),
-                horizontal=True,
-                index=2,
-                key="ensemble_type_radio",
-                help=(
-                    "**Unsupervised**: PCA+Mahalanobis, Isolation Forest, Autoencoder (benign-only). "
-                    "**Supervised**: Linear Probe, Contrastive Direction, Contrastive Mahalanobis. "
-                    "**Hybrid**: Linear Probe, Contrastive Direction + Autoencoder."
-                ),
-            )
+            st.markdown(":green[**SUPERVISED**]")
+            sup_cols = st.columns(4)
+            sup_detectors = [
+                (k, v) for k, v in _DETECTOR_REGISTRY.items()
+                if v["type"] == "supervised"
+            ]
+            for i, (key, info) in enumerate(sup_detectors):
+                with sup_cols[i % 4]:
+                    default = key == "linear_probe"
+                    st.checkbox(
+                        info["display"], value=default, key=f"sel_{key}",
+                    )
         else:
-            ensemble_type = "unsupervised"
-            st.info("Using **unsupervised** ensemble (no labeled jailbreaks in training split).")
+            st.info("No labeled jailbreaks — supervised detectors unavailable.")
+            for key, info in _DETECTOR_REGISTRY.items():
+                if info["type"] == "supervised":
+                    st.session_state[f"sel_{key}"] = False
 
-        st.markdown("**Detectors in this ensemble:**")
-        for det_name, det_type, det_weight in _ENSEMBLE_DETECTORS[ensemble_type]:
-            badge = ":green[supervised]" if det_type == "sup" else ":blue[unsupervised]"
-            st.markdown(f"- {det_name} ({badge}, weight={det_weight})")
+        # Unsupervised group
+        st.markdown(":blue[**UNSUPERVISED**]")
+        unsup_cols = st.columns(3)
+        unsup_detectors = [
+            (k, v) for k, v in _DETECTOR_REGISTRY.items()
+            if v["type"] == "unsupervised"
+        ]
+        for i, (key, info) in enumerate(unsup_detectors):
+            with unsup_cols[i % 3]:
+                default = key == "autoencoder"
+                st.checkbox(
+                    info["display"], value=default, key=f"sel_{key}",
+                )
 
-        # Layer and PCA controls
-        cfg_col1, cfg_col2 = st.columns(2)
+        # Ensemble option
+        st.markdown("**ENSEMBLE**")
+        use_ensemble = st.checkbox(
+            "Custom Ensemble (combine selected detectors)",
+            value=False, key="sel_ensemble",
+            help="Trains all selected detectors individually AND creates a weighted ensemble.",
+        )
+
+        # Collect selected detectors
+        selected_keys = [
+            k for k in _DETECTOR_REGISTRY
+            if st.session_state.get(f"sel_{k}", False)
+        ]
+
+        if not selected_keys:
+            st.warning("Select at least one detector.")
+            st.stop()
+
+        # ---- Ensemble weight sliders (only if ensemble checked) ----
+        det_weights: dict[str, float] = {}
+        if use_ensemble and len(selected_keys) > 1:
+            st.markdown("**Ensemble Weights**")
+            w_cols = st.columns(min(len(selected_keys), 4))
+            for i, key in enumerate(selected_keys):
+                info = _DETECTOR_REGISTRY[key]
+                with w_cols[i % min(len(selected_keys), 4)]:
+                    det_weights[key] = st.number_input(
+                        info["display"],
+                        value=info["default_weight"],
+                        min_value=0.1, step=0.5,
+                        key=f"w_{key}",
+                    )
+        else:
+            for key in selected_keys:
+                det_weights[key] = _DETECTOR_REGISTRY[key]["default_weight"]
+
+        # ---- SECTION 2: Configuration ----
+        st.markdown("---")
+        st.markdown("**Configuration**")
+
+        # Shared config: layer + PCA
+        cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
         with cfg_col1:
             default_layer = available_layers[len(available_layers) // 2]
             layer = st.selectbox(
@@ -714,13 +925,13 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
                 index=available_layers.index(default_layer),
                 key="train_layer",
             )
+        with cfg_col2:
             pca_dims = st.slider(
                 "PCA dimensions",
-                min_value=10, max_value=100, value=config.pca_dims, step=5,
+                min_value=10, max_value=200, value=config.pca_dims, step=5,
                 key="train_pca_dims",
             )
-
-        with cfg_col2:
+        with cfg_col3:
             threshold_pctile = st.slider(
                 "Threshold percentile",
                 min_value=90.0, max_value=99.0,
@@ -728,38 +939,103 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
                 key="train_threshold",
             )
 
-        # Manual detector selection (unsupervised only)
-        if ensemble_type == "unsupervised":
-            det_col1, det_col2, det_col3 = st.columns(3)
-            with det_col1:
-                use_pca_maha = st.checkbox("PCA + Mahalanobis", value=True, key="use_pca_maha")
-                weight_pca_maha = st.number_input(
-                    "Weight", value=config.weight_pca_mahalanobis, min_value=0.1, step=0.5,
-                    key="w_pca",
-                ) if use_pca_maha else 0.0
-            with det_col2:
-                use_iforest = st.checkbox("Isolation Forest", value=True, key="use_iforest")
-                weight_iforest = st.number_input(
-                    "Weight", value=config.weight_isolation_forest, min_value=0.1, step=0.5,
-                    key="w_if",
-                ) if use_iforest else 0.0
-            with det_col3:
-                use_autoencoder = st.checkbox("Autoencoder", value=True, key="use_ae")
-                weight_ae = st.number_input(
-                    "Weight", value=config.weight_autoencoder, min_value=0.1, step=0.5,
-                    key="w_ae",
-                ) if use_autoencoder else 0.0
+        # Per-detector config (in expanders)
+        det_kwargs: dict[str, dict] = {k: {} for k in selected_keys}
 
-            n_detectors = sum([use_pca_maha, use_iforest, use_autoencoder])
-            if n_detectors == 0:
-                st.error("Select at least one detector.")
-                st.stop()
+        has_configurable = any(
+            k in ("linear_probe", "autoencoder", "pca_mahalanobis",
+                   "isolation_forest", "contrastive_mahalanobis", "mlp_probe")
+            for k in selected_keys
+        )
+        if has_configurable:
+            with st.expander("Per-detector settings", expanded=False):
+                for key in selected_keys:
+                    if key == "linear_probe":
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            det_kwargs[key]["C"] = st.number_input(
+                                "Linear Probe: Regularization C",
+                                value=1.0, min_value=0.01, step=0.1,
+                                key="cfg_lp_C",
+                            )
+                    elif key == "autoencoder":
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            det_kwargs[key]["epochs"] = st.slider(
+                                "Autoencoder: Epochs",
+                                min_value=50, max_value=500, value=200, step=50,
+                                key="cfg_ae_epochs",
+                            )
+                        with c2:
+                            det_kwargs[key]["hidden_dim"] = st.number_input(
+                                "Autoencoder: Hidden dim",
+                                value=64, min_value=16, step=16,
+                                key="cfg_ae_hidden",
+                            )
+                    elif key == "mlp_probe":
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            det_kwargs[key]["hidden1"] = st.number_input(
+                                "MLP: Hidden 1", value=128, min_value=16, step=16,
+                                key="cfg_mlp_h1",
+                            )
+                        with c2:
+                            det_kwargs[key]["hidden2"] = st.number_input(
+                                "MLP: Hidden 2", value=32, min_value=8, step=8,
+                                key="cfg_mlp_h2",
+                            )
+                        with c3:
+                            det_kwargs[key]["epochs"] = st.slider(
+                                "MLP: Epochs",
+                                min_value=50, max_value=500, value=200, step=50,
+                                key="cfg_mlp_epochs",
+                            )
+                    elif key == "pca_mahalanobis":
+                        det_kwargs[key]["regularization"] = st.number_input(
+                            "PCA+Mahalanobis: Regularization",
+                            value=1e-6, min_value=0.0, step=1e-6, format="%.1e",
+                            key="cfg_pcam_reg",
+                        )
+                    elif key == "isolation_forest":
+                        det_kwargs[key]["n_estimators"] = st.number_input(
+                            "Isolation Forest: N estimators",
+                            value=200, min_value=50, step=50,
+                            key="cfg_if_est",
+                        )
+                    elif key == "contrastive_mahalanobis":
+                        det_kwargs[key]["regularization"] = st.number_input(
+                            "Contrastive Mahalanobis: Regularization",
+                            value=1e-5, min_value=0.0, step=1e-5, format="%.1e",
+                            key="cfg_cm_reg",
+                        )
 
-        if st.button("Train Ensemble", type="primary", key="train_ensemble"):
-            # Get training data (unified 6-key format)
+        # ---- SECTION 3: Auto-Optimize ----
+        st.markdown("---")
+        auto_optimize = st.checkbox(
+            "Auto-optimize hyperparameters",
+            value=False, key="auto_optimize",
+            help="Grid search over PCA dims and layers on validation data.",
+        )
+
+        if auto_optimize:
+            auto_pca_grid = [10, 20, 30, 50, 75, 100]
+            auto_layer_grid = available_layers
+            n_configs = len(auto_pca_grid) * len(auto_layer_grid) * len(selected_keys)
+            st.info(
+                f"Will search {len(auto_pca_grid)} PCA dims x "
+                f"{len(auto_layer_grid)} layers x "
+                f"{len(selected_keys)} detectors = "
+                f"**{n_configs} configurations**."
+            )
+
+        # ---- SECTION 4: Training Execution ----
+        st.markdown("---")
+
+        if st.button("Train Selected Detectors", type="primary", key="train_detectors"):
+            # Load training data
             X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
             X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
-            if ensemble_type in ("supervised", "hybrid"):
+            if has_labeled_jailbreaks:
                 X_train_jailbreak = store.get_activations(
                     layer, indices=splits["train_jailbreak"].indices.tolist()
                 )
@@ -770,42 +1046,166 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
                 X_train_jailbreak = None
                 X_val_jailbreak = None
 
-            # Build ensemble
-            if ensemble_type == "unsupervised":
-                ensemble = DetectorEnsemble(threshold_percentile=threshold_pctile)
-                if use_pca_maha:
-                    ensemble.add_detector(
-                        "pca_mahalanobis",
-                        PCAMahalanobisDetector(n_components=pca_dims),
-                        weight=weight_pca_maha,
-                    )
-                if use_iforest:
-                    ensemble.add_detector(
-                        "isolation_forest",
-                        IsolationForestDetector(n_components=pca_dims),
-                        weight=weight_iforest,
-                    )
-                if use_autoencoder:
-                    ensemble.add_detector(
-                        "autoencoder",
-                        AutoencoderDetector(n_components=pca_dims),
-                        weight=weight_ae,
-                    )
-                n_detectors = sum([use_pca_maha, use_iforest, use_autoencoder])
-            elif ensemble_type == "supervised":
-                ensemble = create_supervised_ensemble(threshold_percentile=threshold_pctile)
-                n_detectors = len(ensemble.detectors)
-            else:
-                ensemble = create_hybrid_ensemble(threshold_percentile=threshold_pctile)
-                n_detectors = len(ensemble.detectors)
+            # Build ensemble with all selected detectors
+            ensemble = DetectorEnsemble(threshold_percentile=threshold_pctile)
+            for key in selected_keys:
+                info = _DETECTOR_REGISTRY[key]
+                det_type = (
+                    DetectorType.SUPERVISED
+                    if info["type"] == "supervised"
+                    else DetectorType.UNSUPERVISED
+                )
+                detector = info["factory"](pca_dims, **det_kwargs[key])
+                ensemble.add_detector(
+                    key, detector, weight=det_weights[key],
+                    detector_type=det_type,
+                )
 
-            with st.status("Training ensemble...", expanded=True) as status:
+            # --- Auto-optimize path ---
+            if auto_optimize:
+                auto_pca_grid = [10, 20, 30, 50, 75, 100]
+                auto_layer_grid = available_layers
+                best_configs: dict[str, dict] = {}
+                n_total = len(auto_pca_grid) * len(auto_layer_grid) * len(selected_keys)
+
+                with st.status("Auto-optimizing...", expanded=True) as opt_status:
+                    progress = st.progress(0)
+                    status_text = st.empty()
+                    results_area = st.empty()
+                    step = 0
+
+                    for key in selected_keys:
+                        info = _DETECTOR_REGISTRY[key]
+                        best_auroc = -1.0
+                        best_cfg: dict = {}
+
+                        for try_layer in auto_layer_grid:
+                            X_tr_l = store.get_activations(
+                                try_layer,
+                                indices=splits["train_benign"].indices.tolist(),
+                            )
+                            X_va_l = store.get_activations(
+                                try_layer,
+                                indices=splits["val_benign"].indices.tolist(),
+                            )
+                            X_tr_jb_l = (
+                                store.get_activations(
+                                    try_layer,
+                                    indices=splits["train_jailbreak"].indices.tolist(),
+                                )
+                                if has_labeled_jailbreaks else None
+                            )
+                            X_va_jb_l = (
+                                store.get_activations(
+                                    try_layer,
+                                    indices=splits["val_jailbreak"].indices.tolist(),
+                                )
+                                if has_labeled_jailbreaks else None
+                            )
+
+                            for try_pca in auto_pca_grid:
+                                step += 1
+                                status_text.text(
+                                    f"[{info['display']}] Config {step}/{n_total}: "
+                                    f"Layer {try_layer}, PCA {try_pca}"
+                                )
+                                progress.progress(step / n_total)
+
+                                try:
+                                    det = info["factory"](try_pca, **det_kwargs.get(key, {}))
+                                    det_type = info["type"]
+                                    if det_type == "supervised":
+                                        if X_tr_jb_l is None:
+                                            continue
+                                        X_combined = np.vstack([X_tr_l, X_tr_jb_l])
+                                        y_combined = np.concatenate([
+                                            np.zeros(len(X_tr_l), dtype=np.int64),
+                                            np.ones(len(X_tr_jb_l), dtype=np.int64),
+                                        ])
+                                        det.fit(X_combined, y_combined)
+                                    else:
+                                        det.fit(X_tr_l)
+
+                                    auroc = _compute_detector_val_auroc(
+                                        det, X_va_l, X_va_jb_l,
+                                    )
+                                    if auroc is not None and auroc > best_auroc:
+                                        best_auroc = auroc
+                                        best_cfg = {
+                                            "layer": try_layer, "pca": try_pca,
+                                            "auroc": auroc,
+                                        }
+                                except Exception:
+                                    continue
+
+                        best_configs[key] = best_cfg
+
+                    opt_status.update(label="Auto-optimize complete!", state="complete")
+
+                # Show auto-optimize results
+                st.markdown("**Auto-optimize results:**")
+                for key in selected_keys:
+                    cfg = best_configs.get(key, {})
+                    info = _DETECTOR_REGISTRY[key]
+                    if cfg:
+                        st.markdown(
+                            f"- **{info['display']}**: Layer {cfg['layer']}, "
+                            f"PCA {cfg['pca']} → Val AUROC: {cfg['auroc']:.3f}"
+                        )
+                    else:
+                        st.markdown(f"- **{info['display']}**: No valid config found")
+
+                # Use best layer/PCA from primary detector
+                primary_key = selected_keys[0]
+                best_primary = best_configs.get(primary_key, {})
+                if best_primary:
+                    layer = best_primary["layer"]
+                    pca_dims = best_primary["pca"]
+                    st.info(
+                        f"Using best config from **{_DETECTOR_REGISTRY[primary_key]['display']}**: "
+                        f"Layer {layer}, PCA {pca_dims}"
+                    )
+
+                # Rebuild ensemble with optimal PCA
+                X_train = store.get_activations(
+                    layer, indices=splits["train_benign"].indices.tolist()
+                )
+                X_val = store.get_activations(
+                    layer, indices=splits["val_benign"].indices.tolist()
+                )
+                if has_labeled_jailbreaks:
+                    X_train_jailbreak = store.get_activations(
+                        layer, indices=splits["train_jailbreak"].indices.tolist()
+                    )
+                    X_val_jailbreak = store.get_activations(
+                        layer, indices=splits["val_jailbreak"].indices.tolist()
+                    )
+
+                ensemble = DetectorEnsemble(threshold_percentile=threshold_pctile)
+                for key in selected_keys:
+                    info = _DETECTOR_REGISTRY[key]
+                    det_type_enum = (
+                        DetectorType.SUPERVISED
+                        if info["type"] == "supervised"
+                        else DetectorType.UNSUPERVISED
+                    )
+                    detector = info["factory"](pca_dims, **det_kwargs.get(key, {}))
+                    ensemble.add_detector(
+                        key, detector, weight=det_weights[key],
+                        detector_type=det_type_enum,
+                    )
+
+            # --- Train ensemble (final or only pass) ---
+            trained_results: list[dict] = []
+
+            with st.status("Training detectors...", expanded=True) as status:
                 t0 = time.perf_counter()
 
+                # Show what will be trained
                 for name, det, weight in ensemble.detectors:
                     det_type = ensemble.detector_types_.get(name, DetectorType.UNSUPERVISED)
                     type_label = "supervised" if det_type == DetectorType.SUPERVISED else "unsupervised"
-                    st.write(f"Fitting **{name}** ({type_label}, weight={weight})...")
+                    st.write(f"Training **{name}** ({type_label}, weight={weight})...")
 
                 ensemble.fit(
                     X_train, X_val,
@@ -815,43 +1215,37 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
                 elapsed = time.perf_counter() - t0
                 status.update(label="Training complete!", state="complete")
 
-            # Select primary detector
-            from sklearn.metrics import roc_curve as _roc_curve  # type: ignore[import-untyped]
+            # Select primary and calibrate threshold
+            primary_name, primary_det = _select_primary_detector(ensemble)
+            primary_threshold, val_fpr = _calibrate_primary_threshold(
+                primary_det, X_val, X_val_jailbreak, threshold_pctile,
+            )
 
-            _priority = ["linear_probe", "pca_mahalanobis", "contrastive_mahalanobis",
-                         "isolation_forest", "autoencoder", "contrastive_direction"]
-            det_names_in_ens = {n for n, _, _ in ensemble.detectors}
-            primary_name = None
-            primary_det = None
-            for candidate in _priority:
-                if candidate in det_names_in_ens:
-                    primary_name = candidate
-                    for n, d, _ in ensemble.detectors:
-                        if n == candidate:
-                            primary_det = d
-                            break
-                    break
-            if primary_name is None and ensemble.detectors:
-                primary_name = ensemble.detectors[0][0]
-                primary_det = ensemble.detectors[0][1]
+            # Compute per-detector AUROC for the summary
+            for name, det, weight in ensemble.detectors:
+                det_t0 = time.perf_counter()
+                auroc = _compute_detector_val_auroc(det, X_val, X_val_jailbreak)
+                trained_results.append({
+                    "name": name,
+                    "display": _DETECTOR_REGISTRY[name]["display"],
+                    "val_auroc": auroc,
+                    "time_s": elapsed / len(ensemble.detectors),
+                    "is_primary": name == primary_name,
+                })
 
-            # Calibrate primary threshold
-            primary_val_scores = primary_det.score(X_val)
-            if X_val_jailbreak is not None and len(X_val_jailbreak) > 0:
-                primary_jb_scores = primary_det.score(X_val_jailbreak)
-                all_scores = np.concatenate([primary_val_scores, primary_jb_scores])
-                all_labels = np.concatenate([
-                    np.zeros(len(primary_val_scores), dtype=np.int64),
-                    np.ones(len(primary_jb_scores), dtype=np.int64),
-                ])
-                fpr_arr, tpr_arr, thresholds_arr = _roc_curve(all_labels, all_scores)
-                j_stat = tpr_arr - fpr_arr
-                best_idx = int(np.argmax(j_stat))
-                primary_threshold = float(np.nextafter(thresholds_arr[best_idx], -np.inf))
+            # Determine ensemble type for metadata
+            has_sup = any(
+                _DETECTOR_REGISTRY[k]["type"] == "supervised" for k in selected_keys
+            )
+            has_unsup = any(
+                _DETECTOR_REGISTRY[k]["type"] == "unsupervised" for k in selected_keys
+            )
+            if has_sup and has_unsup:
+                ensemble_type = "hybrid"
+            elif has_sup:
+                ensemble_type = "supervised"
             else:
-                primary_threshold = float(np.percentile(primary_val_scores, threshold_pctile))
-
-            val_fpr = float(np.mean(primary_val_scores > primary_threshold))
+                ensemble_type = "unsupervised"
 
             # Save model
             output_dir = config.models_dir / f"detector_{ensemble_type}_v1"
@@ -868,14 +1262,14 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
             with open(output_dir / "pipeline_meta.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
 
-            # Update state
+            # ---- SECTION 5: Post-Training — update state and show banner ----
             train_metrics = {
                 "val_false_positive_rate": val_fpr,
                 "threshold": primary_threshold,
                 "ensemble_threshold": float(ensemble.threshold_),
                 "layer": int(layer),
                 "pca_dims": int(pca_dims),
-                "n_detectors": int(n_detectors),
+                "n_detectors": len(selected_keys),
                 "ensemble_type": ensemble_type,
                 "primary_detector": primary_name,
                 "training_time_s": round(elapsed, 1),
@@ -884,17 +1278,8 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
             state.reset_from(4)
             state.model_path = output_dir
             state.train_metrics = train_metrics
+            state.trained_detectors = trained_results
             state.model_ready = True
 
-            st.success(
-                f"Trained {ensemble_type} ensemble in {elapsed:.1f}s. "
-                f"Primary detector: **{primary_name}**"
-            )
-
-            res_col1, res_col2, res_col3 = st.columns(3)
-            with res_col1:
-                st.metric("Validation FPR", f"{val_fpr:.4f} ({val_fpr * 100:.1f}%)")
-            with res_col2:
-                st.metric("Primary Threshold", f"{primary_threshold:.4f}")
-            with res_col3:
-                st.metric("Training time", f"{elapsed:.1f}s")
+            # Force rerun so sidebar refreshes with checkmark
+            st.rerun()

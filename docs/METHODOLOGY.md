@@ -207,8 +207,86 @@ This percentile is configurable (90th-99th) in the dashboard's Train page.
 
 Venator trades some accuracy for robustness to novel attacks. In practice, the unsupervised approach is most valuable as a **complementary signal** alongside supervised classifiers — its errors are decorrelated from supervised methods, improving overall system reliability.
 
+## 9. From Unsupervised to Semi-Supervised: A Research Journey
+
+### The Starting Point
+
+Venator began with a strict unsupervised constraint: train only on benign prompts, never expose the detector to jailbreaks. This was both principled and practical — principled because it catches novel attacks by construction, practical because labeled jailbreak datasets are expensive to curate and quickly become stale.
+
+The unsupervised ensemble (PCA + Mahalanobis, Isolation Forest, Autoencoder) achieved 0.85–0.95 AUROC depending on the attack category, validating the core hypothesis that jailbreaks produce distinguishable activation patterns. For broad categories of attack — DAN-style prompts, encoding tricks, role-play jailbreaks — the signal was strong enough to detect without supervision.
+
+### What the Data Showed
+
+But not all jailbreak categories are equally detectable unsupervised. Running ablations revealed a pattern:
+
+- **Encoding attacks** (Base64, ROT13): AUROC 0.90+ — these produce dramatically different activation patterns because the model processes encoded text differently at every layer.
+- **DAN/persona jailbreaks**: AUROC 0.85–0.92 — the "pretend you're DAN" framing creates measurable activation shifts, though some variants stay closer to the benign distribution.
+- **Subtle multi-turn jailbreaks**: AUROC 0.75–0.85 — these are specifically designed to stay close to normal conversation patterns, making them harder to distinguish from benign prompts without knowing what "jailbreak-like" looks like.
+
+The unsupervised ceiling is real. When an attack is *designed* to mimic normal activation patterns, unsupervised methods hit a fundamental limit: they can only flag deviations from normal, and a well-crafted attack minimizes that deviation.
+
+### The Research Question
+
+This raised a practical question: in a deployment scenario, we almost always have *some* labeled jailbreaks — from red-teaming, from user reports, from public datasets. Could a small number of labeled examples meaningfully improve detection, without sacrificing the generalization properties of the unsupervised approach?
+
+The answer from the literature was encouraging. Cunningham et al. (2025) showed that even simple probes using few-shot labeled data can produce effective safety monitors — what they called "cheap monitors" — when applied to internal model representations. Sharma et al. (2025) demonstrated similar findings with constitutional classifiers. The key insight: you don't need thousands of labeled jailbreaks. A few dozen, combined with the right representation (middle-layer activations), can substantially improve detection.
+
+### The Semi-Supervised Extension
+
+Venator's semi-supervised mode introduces labeled jailbreaks into training while preserving the core methodology:
+
+1. **Small label budget**: Only 15% of jailbreaks go to training, 15% to validation, 70% reserved for uncontaminated testing. This keeps the test set credible.
+
+2. **Supervised detectors complement, not replace**: The supervised detectors (Linear Probe, Contrastive Direction) learn the *direction* of jailbreak activation patterns. The unsupervised detectors still catch anything that deviates from normal, including attack types absent from the labeled set.
+
+3. **Three ensemble configurations**:
+   - **Unsupervised**: The original approach. No jailbreaks in training. Baseline for comparison.
+   - **Supervised**: Linear Probe + Contrastive Direction + Contrastive Mahalanobis. Uses labeled data only.
+   - **Hybrid** (default for semi-supervised): Linear Probe + Contrastive Direction + Autoencoder. Best of both — supervised precision on known categories, unsupervised coverage on novel ones.
+
+4. **Supervised threshold calibration**: When labeled jailbreaks are available in the validation set, thresholds are set using Youden's J statistic (maximizing TPR - FPR) or F1 optimization, rather than a fixed benign-only percentile. This produces better operating points because the threshold can see both sides of the decision boundary.
+
+### What Changed and What Didn't
+
+**What changed:**
+- Jailbreaks can now appear in training and validation splits (semi-supervised mode)
+- New supervised detectors: Linear Probe, Contrastive Direction, Contrastive Mahalanobis
+- Threshold calibration uses labeled data when available
+- The hybrid ensemble becomes the recommended default
+
+**What didn't change:**
+- The unsupervised mode still works exactly as before — it's the baseline
+- Test data is always uncontaminated (majority of jailbreaks reserved)
+- The core insight that middle-layer activations carry the signal
+- PCA dimensionality reduction for healthy sample-to-feature ratios
+- Score normalization before ensemble combination
+- All methodology validation checks still enforced programmatically
+
+### Label Efficiency
+
+The ablation studies reveal that supervised detectors reach useful accuracy with surprisingly few labeled jailbreaks:
+
+- **10–20 labeled examples**: Linear Probe typically matches or exceeds the best unsupervised detector
+- **30–50 labeled examples**: Performance gains plateau — more labels give diminishing returns
+- **Cross-source generalization**: A probe trained on one jailbreak category (e.g., DAN) partially generalizes to others (e.g., encoding attacks), though with reduced AUROC
+
+This aligns with the "cheap monitors" finding: the jailbreak direction in activation space is relatively low-dimensional, so a small number of examples suffice to identify it.
+
+### The Honest Trade-Off
+
+Semi-supervised detection is strictly better when you have labeled data — the hybrid ensemble consistently outperforms unsupervised-only. But it introduces a dependency on label quality and coverage. If your labeled jailbreaks are all from one category, the supervised detectors learn that category well but may not help with others. The unsupervised components provide a safety net, but the overall system is only as good as the diversity of its training signals.
+
+The unsupervised mode remains valuable as:
+- A baseline for measuring how much supervision actually helps
+- A fallback when no labeled jailbreaks are available
+- A complement to supervised detectors for catching truly novel attacks
+
+Both modes are first-class citizens in Venator. The dashboard's Evaluate page supports direct comparison between them, and the Ablations page includes label efficiency studies to help users decide how many labeled examples are worth collecting.
+
 ## References
 
 1. Mallen et al., "Eliciting Latent Knowledge from Quirky Language Models" (arXiv:2312.01037, 2024)
 2. Burns et al., "Discovering Latent Knowledge Without Supervision" (arXiv:2212.03827, 2022)
 3. Chao et al., "JailbreakBench: An Open Robustness Benchmark for Jailbreaking LLMs" (arXiv:2404.01318, 2024)
+4. Cunningham et al., "Monitoring Reasoning Models for Misbehavior and the Risks of Promoting Obfuscation" (2025)
+5. Sharma et al., "Constitutional Classifiers: Defending against Universal Jailbreaks across Thousands of Hours of Red Teaming" (2025)

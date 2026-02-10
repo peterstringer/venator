@@ -1,5 +1,6 @@
 {
   "seed": 42,
+  "mode": "unsupervised",
   "splits": {
     "train": {
       "name": "train",

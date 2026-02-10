@@ -63,6 +63,7 @@ class PipelineState:
         # Results
         "eval_results": None,
         "train_metrics": None,
+        "trained_detectors": None,
         # Config
         "config": None,
         # Initialized flag
@@ -196,6 +197,14 @@ class PipelineState:
     def train_metrics(self, value: dict | None) -> None:
         st.session_state["train_metrics"] = value
 
+    @property
+    def trained_detectors(self) -> list[dict] | None:
+        return st.session_state["trained_detectors"]
+
+    @trained_detectors.setter
+    def trained_detectors(self, value: list[dict] | None) -> None:
+        st.session_state["trained_detectors"] = value
+
     # ------------------------------------------------------------------
     # Config
     # ------------------------------------------------------------------
@@ -254,22 +263,23 @@ class PipelineState:
                 "model_ready", "evaluation_ready",
                 "benign_path", "jailbreak_path", "store_path",
                 "splits_path", "model_path",
-                "eval_results", "train_metrics",
+                "eval_results", "train_metrics", "trained_detectors",
             ],
             2: [
                 "activations_ready", "splits_ready",
                 "model_ready", "evaluation_ready",
                 "store_path", "splits_path", "model_path",
-                "eval_results", "train_metrics",
+                "eval_results", "train_metrics", "trained_detectors",
             ],
             3: [
                 "splits_ready", "model_ready", "evaluation_ready",
                 "splits_path", "model_path",
-                "eval_results", "train_metrics",
+                "eval_results", "train_metrics", "trained_detectors",
             ],
             4: [
                 "model_ready", "evaluation_ready",
                 "model_path", "eval_results", "train_metrics",
+                "trained_detectors",
             ],
             5: [
                 "evaluation_ready", "eval_results",
