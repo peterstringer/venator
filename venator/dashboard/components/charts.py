@@ -350,6 +350,72 @@ def ablation_line_chart(
     return fig
 
 
+def ablation_multi_line_chart(
+    series: dict[str, tuple[list[int | float], list[float]]],
+    x_label: str,
+    y_label: str,
+    title: str = "",
+    highlight_best: bool = True,
+) -> go.Figure:
+    """Multi-series line chart for comparing detectors across an ablation axis.
+
+    Args:
+        series: Mapping of series name to (x_values, y_values).
+        x_label: X-axis label.
+        y_label: Y-axis label.
+        title: Optional chart title.
+        highlight_best: Whether to highlight the best point per series.
+
+    Returns:
+        Plotly Figure with overlaid line charts.
+    """
+    colors = [
+        "rgba(55, 128, 191, 1)",
+        "rgba(44, 160, 101, 1)",
+        "rgba(219, 64, 82, 1)",
+        "rgba(153, 102, 204, 1)",
+        "rgba(255, 159, 64, 1)",
+        "rgba(0, 128, 128, 1)",
+        "rgba(233, 30, 99, 1)",
+    ]
+
+    fig = go.Figure()
+    for i, (name, (x_vals, y_vals)) in enumerate(series.items()):
+        color = colors[i % len(colors)]
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=y_vals,
+                mode="lines+markers",
+                name=name,
+                line=dict(color=color),
+                marker=dict(size=8),
+            )
+        )
+        if highlight_best and y_vals:
+            best_idx = int(np.argmax(y_vals))
+            fig.add_trace(
+                go.Scatter(
+                    x=[x_vals[best_idx]],
+                    y=[y_vals[best_idx]],
+                    mode="markers",
+                    name=f"{name} best: {y_vals[best_idx]:.4f}",
+                    marker=dict(size=12, color=color, symbol="star"),
+                    showlegend=False,
+                )
+            )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=400,
+        margin=dict(t=40, b=40, l=40, r=20),
+        template="plotly_white",
+    )
+    return fig
+
+
 def correlation_heatmap(
     scores: dict[str, np.ndarray],
     title: str = "Score Correlation Heatmap",

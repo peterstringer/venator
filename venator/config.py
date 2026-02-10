@@ -24,8 +24,8 @@ class VenatorConfig(BaseSettings):
 
     # --- Activation extraction ---
     extraction_layers: list[int] = Field(
-        default=[12, 14, 16, 18, 20],
-        description="Transformer layers to extract hidden states from (middle layers per ELK findings)",
+        default=[4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        description="Transformer layers to extract hidden states from (wide range to find optimal via ablations)",
     )
     extraction_batch_size: int = Field(
         default=1,
