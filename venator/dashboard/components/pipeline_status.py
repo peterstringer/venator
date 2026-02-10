@@ -1,37 +1,32 @@
-"""Sidebar pipeline progress tracker component.
+"""Sidebar branding and stats component.
 
-Renders a vertical step indicator in the Streamlit sidebar showing which
-pipeline pages are available, which is current, and which are locked.
+Renders the VENATOR header and optional pipeline stats in the sidebar.
+Navigation with status icons is handled by the page titles in app.py —
+this module provides only the supplementary sidebar content.
 """
 
 from __future__ import annotations
+
+import json
+import logging
 
 import streamlit as st
 
 from venator.dashboard.state import PipelineState
 
-
-# Page display config: (number, name, page_key)
-_STAGES = [
-    (1, "Pipeline", "pipeline"),
-    (2, "Results", "results"),
-    (3, "Explore", "explore"),
-    (4, "Live Detection", "detect"),
-    (5, "Ablations", "ablations"),
-]
+logger = logging.getLogger(__name__)
 
 
-def render_pipeline_sidebar(state: PipelineState, current_page: str = "") -> None:
-    """Render the pipeline progress tracker in the sidebar.
+def render_sidebar_header(state: PipelineState) -> None:
+    """Render the VENATOR header and pipeline stats in the sidebar.
 
-    Shows a vertical list of pages with status indicators:
-    - The Pipeline page shows sub-step progress (Data/Extract/Split/Train)
-    - Locked pages (prerequisites not met) are grayed out
-    - The current page is highlighted
+    The sidebar contains:
+    1. VENATOR branding header
+    2. Progress summary (N/4 pipeline steps complete)
+    3. Model stats when a trained model is available
 
     Args:
         state: Current pipeline state.
-        current_page: Key of the currently active page (for highlighting).
     """
     with st.sidebar:
         # Header
@@ -39,7 +34,7 @@ def render_pipeline_sidebar(state: PipelineState, current_page: str = "") -> Non
             """
             <div style="text-align: center; padding: 0.5rem 0 1rem 0;">
                 <h2 style="margin: 0; letter-spacing: 0.15em; font-weight: 700;">
-                    VENATOR
+                    \U0001f3af VENATOR
                 </h2>
                 <p style="margin: 0; font-size: 0.75rem; color: #888; letter-spacing: 0.05em;">
                     Jailbreak Detection Pipeline
@@ -51,34 +46,21 @@ def render_pipeline_sidebar(state: PipelineState, current_page: str = "") -> Non
 
         st.divider()
 
-        # Pipeline pages
-        for stage_num, stage_name, page_key in _STAGES:
-            available = state.is_stage_available(stage_num)
-            is_current = current_page == page_key
-
-            if is_current:
-                label = f":arrow_right: **{stage_name}**"
-                st.markdown(label)
-            elif available:
-                label = f":radio_button: {stage_name}"
-                st.markdown(label)
-            else:
-                label = f":lock: {stage_name}"
-                st.markdown(
-                    f"<span style='color: #666;'>{label}</span>",
-                    unsafe_allow_html=True,
-                )
-
-            # Show sub-steps for the Pipeline page
-            if stage_name == "Pipeline":
-                substeps = state.get_progress()
-                for sub_name, sub_done in substeps:
-                    sub_icon = ":white_check_mark:" if sub_done else ":radio_button:"
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;{sub_icon} {sub_name}")
-
-        st.divider()
-
-        # Summary stats — count pipeline sub-steps
+        # Progress summary
         progress = state.get_progress()
         n_complete = sum(1 for _, done in progress if done)
         st.caption(f"{n_complete}/4 pipeline steps complete")
+
+        # Model stats (from pipeline_meta.json if available)
+        if state.model_ready and state.model_path:
+            meta_path = state.model_path / "pipeline_meta.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    model_id = meta.get("model_id", "")
+                    model_short = model_id.split("/")[-1] if "/" in model_id else model_id
+                    layer = meta.get("layer", "?")
+                    st.caption(f"Model: {model_short} | Layer: {layer}")
+                except Exception:
+                    logger.debug("Could not read pipeline_meta.json for sidebar stats")
