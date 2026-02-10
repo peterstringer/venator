@@ -13,7 +13,7 @@ Usage::
     # Full pipeline (with MLX model)
     pipeline = VenatorPipeline.from_config()
     store = pipeline.extract_and_store(prompts, "data/activations/all.h5")
-    splits = SplitManager().create_splits(store, mode=SplitMode.UNSUPERVISED)
+    splits = SplitManager().create_splits(store)
     pipeline.train(store, splits)
     metrics = pipeline.evaluate(store, splits)
     result = pipeline.detect("Is this a jailbreak?")
@@ -251,10 +251,9 @@ class VenatorPipeline:
 
         Args:
             store: ActivationStore with extracted activations.
-            splits: Split dict from SplitManager. Either unsupervised
-                (``"train"``/``"val"``) or semi-supervised
-                (``"train_benign"``/``"val_benign"``/``"train_jailbreak"``/
-                ``"val_jailbreak"``).
+            splits: Unified split dict from SplitManager with keys
+                ``"train_benign"``/``"val_benign"``/``"train_jailbreak"``/
+                ``"val_jailbreak"``/``"test_benign"``/``"test_jailbreak"``.
             ensemble_type: One of ``"auto"``, ``"unsupervised"``,
                 ``"supervised"``, ``"hybrid"``. Controls data routing.
 
@@ -269,52 +268,32 @@ class VenatorPipeline:
             )
 
         # --- Extract training/validation data from splits ---
-        if "train" in splits:
-            # Unsupervised splits
-            X_train = store.get_activations(
-                self.layer, indices=splits["train"].indices.tolist()
-            )
-            X_val = store.get_activations(
-                self.layer, indices=splits["val"].indices.tolist()
-            )
-            X_train_jailbreak = None
-            X_val_jailbreak = None
-
-            if ensemble_type in ("supervised", "hybrid"):
-                raise ValueError(
-                    f"ensemble_type={ensemble_type!r} requires semi-supervised "
-                    "splits (keys: 'train_benign', 'train_jailbreak', ...). "
-                    "Got unsupervised splits. Use SplitMode.SEMI_SUPERVISED "
-                    "when creating splits."
-                )
-
-        elif "train_benign" in splits:
-            # Semi-supervised splits
-            X_train = store.get_activations(
-                self.layer, indices=splits["train_benign"].indices.tolist()
-            )
-            X_val = store.get_activations(
-                self.layer, indices=splits["val_benign"].indices.tolist()
-            )
-
-            # Pass jailbreak data unless explicitly unsupervised
-            if ensemble_type == "unsupervised":
-                X_train_jailbreak = None
-                X_val_jailbreak = None
-            else:
-                X_train_jailbreak = store.get_activations(
-                    self.layer,
-                    indices=splits["train_jailbreak"].indices.tolist(),
-                )
-                X_val_jailbreak = store.get_activations(
-                    self.layer,
-                    indices=splits["val_jailbreak"].indices.tolist(),
-                )
-        else:
+        # Unified split format: always has train_benign, val_benign, etc.
+        if "train_benign" not in splits:
             raise ValueError(
                 f"Unrecognized split keys: {set(splits.keys())}. "
-                "Expected 'train'/'val' (unsupervised) or "
-                "'train_benign'/'val_benign' (semi-supervised)."
+                "Expected unified format with 'train_benign', 'val_benign', etc."
+            )
+
+        X_train = store.get_activations(
+            self.layer, indices=splits["train_benign"].indices.tolist()
+        )
+        X_val = store.get_activations(
+            self.layer, indices=splits["val_benign"].indices.tolist()
+        )
+
+        # Pass jailbreak data unless explicitly unsupervised
+        if ensemble_type == "unsupervised":
+            X_train_jailbreak = None
+            X_val_jailbreak = None
+        else:
+            X_train_jailbreak = store.get_activations(
+                self.layer,
+                indices=splits["train_jailbreak"].indices.tolist(),
+            )
+            X_val_jailbreak = store.get_activations(
+                self.layer,
+                indices=splits["val_jailbreak"].indices.tolist(),
             )
 
         logger.info(

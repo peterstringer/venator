@@ -19,7 +19,7 @@ from venator.dashboard.components.charts import (
     score_distribution_chart,
 )
 from venator.dashboard.state import PipelineState
-from venator.data.splits import SplitManager, SplitMode
+from venator.data.splits import SplitManager
 from venator.detection.ensemble import (
     DetectorEnsemble,
     DetectorType,

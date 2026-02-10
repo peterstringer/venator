@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Split activation data into train/val/test with strict methodology constraints.
+"""Create unified train/val/test splits from an activation store.
 
-Supports two modes:
-- UNSUPERVISED: training and validation contain ONLY benign prompts.
-- SEMI_SUPERVISED: a small labeled jailbreak fraction in train/val for
-  supervised/hybrid detectors.
+Produces a single split that serves all detector types:
+    Unsupervised: fit(train_benign) → calibrate(val_benign) → test(test_*)
+    Supervised:   fit(train_benign + train_jailbreak) → calibrate(val_*) → test(test_*)
 
 Usage:
-    # Unsupervised (default)
     python scripts/create_splits.py \
         --store data/activations/all.h5 \
         --output data/splits.json
 
-    # Semi-supervised (for supervised/hybrid detectors)
     python scripts/create_splits.py \
         --store data/activations/all.h5 \
-        --output data/splits_semi.json \
-        --split-mode semi_supervised
+        --output data/splits.json \
+        --jailbreak-train-frac 0.10 \
+        --jailbreak-val-frac 0.10
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from venator.activation.storage import ActivationStore
-from venator.data.splits import SplitManager, SplitMode
+from venator.data.splits import SplitManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create train/val/test splits from an activation store"
+        description="Create unified train/val/test splits from an activation store"
     )
     parser.add_argument(
         "--store",
@@ -68,12 +66,16 @@ def main() -> None:
         help="Fraction of benign prompts for validation (default: 0.15)",
     )
     parser.add_argument(
-        "--split-mode",
-        choices=["unsupervised", "semi_supervised"],
-        default="unsupervised",
-        help="Split mode: unsupervised (jailbreaks test-only) or "
-        "semi_supervised (small jailbreak fraction in train/val). "
-        "Default: unsupervised",
+        "--jailbreak-train-frac",
+        type=float,
+        default=0.15,
+        help="Fraction of jailbreaks for training (default: 0.15)",
+    )
+    parser.add_argument(
+        "--jailbreak-val-frac",
+        type=float,
+        default=0.15,
+        help="Fraction of jailbreaks for validation (default: 0.15)",
     )
     parser.add_argument(
         "--seed",
@@ -87,8 +89,6 @@ def main() -> None:
         logger.error("Store not found: %s", args.store)
         sys.exit(1)
 
-    mode = SplitMode(args.split_mode)
-
     # Load store and create splits
     store = ActivationStore(args.store)
     logger.info("Loaded store: %s", store)
@@ -96,44 +96,49 @@ def main() -> None:
     manager = SplitManager(seed=args.seed)
     splits = manager.create_splits(
         store,
-        mode=mode,
         benign_train_frac=args.train_frac,
         benign_val_frac=args.val_frac,
+        jailbreak_train_frac=args.jailbreak_train_frac,
+        jailbreak_val_frac=args.jailbreak_val_frac,
     )
 
     # Validate (also done inside create_splits, but explicit for user confidence)
-    manager.validate_splits(splits, store, mode=mode)
-    if mode == SplitMode.UNSUPERVISED:
-        logger.info("Validation passed: no jailbreaks in train/val")
-    else:
-        logger.info("Validation passed: label integrity verified for all splits")
+    manager.validate_splits(splits, store)
+    logger.info("Validation passed: label integrity verified for all splits")
 
     # Save
-    manager.save_splits(splits, args.output, mode=mode)
+    manager.save_splits(splits, args.output)
 
     # Summary table
-    print("\n" + "=" * 60)
-    print(f"Split Summary ({mode.value})")
-    print("=" * 60)
-    print(f"{'Split':<20} | {'N Samples':>10} | {'% Jailbreak':>12}")
-    print("-" * 60)
+    n_benign = sum(
+        s.n_samples for name, s in splits.items() if not s.contains_jailbreaks
+    )
+    n_jailbreak = sum(
+        s.n_samples for name, s in splits.items() if s.contains_jailbreaks
+    )
 
-    total = 0
-    for name, split in splits.items():
-        pct = 100.0 if split.contains_jailbreaks else 0.0
-        print(f"{name:<20} | {split.n_samples:>10} | {pct:>11.1f}%")
-        total += split.n_samples
+    print("\n" + "=" * 65)
+    print("Unified Split Summary")
+    print("=" * 65)
 
-    print("-" * 60)
-    print(f"{'Total':<20} | {total:>10} |")
-    print("=" * 60)
+    print(f"\n  YOUR DATA: {n_benign} benign + {n_jailbreak} jailbreak prompts\n")
 
-    print(f"\nSaved to: {args.output}")
-    if mode == SplitMode.UNSUPERVISED:
-        print("No jailbreaks in train or val splits (methodology verified)")
-    else:
-        print("Semi-supervised: small jailbreak fraction in train/val, "
-              "majority reserved for testing")
+    print(f"  {'Split':<20} | {'N Samples':>10} | {'Role':>25}")
+    print("  " + "-" * 60)
+    print(f"  {'train_benign':<20} | {splits['train_benign'].n_samples:>10} | {'unsupervised training':>25}")
+    print(f"  {'train_jailbreak':<20} | {splits['train_jailbreak'].n_samples:>10} | {'supervised training':>25}")
+    print(f"  {'val_benign':<20} | {splits['val_benign'].n_samples:>10} | {'all detectors':>25}")
+    print(f"  {'val_jailbreak':<20} | {splits['val_jailbreak'].n_samples:>10} | {'all detectors':>25}")
+    print(f"  {'test_benign':<20} | {splits['test_benign'].n_samples:>10} | {'final evaluation':>25}")
+    print(f"  {'test_jailbreak':<20} | {splits['test_jailbreak'].n_samples:>10} | {'final evaluation':>25}")
+    print("  " + "-" * 60)
+
+    total = sum(s.n_samples for s in splits.values())
+    print(f"  {'Total':<20} | {total:>10} |")
+
+    print(f"\n  Split once, train anything.")
+    print(f"  Saved to: {args.output}")
+    print("=" * 65)
 
 
 if __name__ == "__main__":

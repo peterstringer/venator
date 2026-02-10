@@ -36,7 +36,7 @@ import numpy as np
 from sklearn.metrics import precision_recall_curve, roc_curve  # type: ignore[import-untyped]
 
 from venator.activation.storage import ActivationStore
-from venator.data.splits import SplitManager, SplitMode
+from venator.data.splits import SplitManager
 from venator.detection.ensemble import DetectorEnsemble, DetectorType
 from venator.detection.metrics import evaluate_detector
 
@@ -413,7 +413,6 @@ def main() -> None:
     ensemble = DetectorEnsemble.load(args.model_dir)
     store = ActivationStore(args.store)
     splits = SplitManager.load_splits(args.splits)
-    split_mode = SplitManager.load_mode(args.splits)
 
     # Pipeline metadata
     meta_path = args.model_dir / "pipeline_meta.json"
@@ -483,12 +482,8 @@ def main() -> None:
     # Count training samples from splits
     # ------------------------------------------------------------------
 
-    if split_mode == SplitMode.SEMI_SUPERVISED:
-        n_train_benign = splits["train_benign"].n_samples
-        n_train_jailbreak = splits["train_jailbreak"].n_samples
-    else:
-        n_train_benign = splits["train"].n_samples
-        n_train_jailbreak = 0
+    n_train_benign = splits["train_benign"].n_samples
+    n_train_jailbreak = splits["train_jailbreak"].n_samples
 
     # ------------------------------------------------------------------
     # Score primary detector

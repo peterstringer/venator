@@ -571,19 +571,20 @@ class TestEnsembleTypeParam:
         )
         assert "val_false_positive_rate" in metrics
 
-    def test_supervised_requires_semi_splits(self, populated_store, splits):
-        """ensemble_type='supervised' with unsupervised splits raises."""
-        ensemble = create_default_ensemble(threshold_percentile=95.0)
+    def test_supervised_works_with_unified_splits(self, populated_store, splits):
+        """ensemble_type='supervised' works with unified splits (always have jailbreak data)."""
+        from venator.detection.ensemble import create_supervised_ensemble
+        ensemble = create_supervised_ensemble(threshold_percentile=95.0)
         pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
-        with pytest.raises(ValueError, match="requires semi-supervised"):
-            pipeline.train(populated_store, splits, ensemble_type="supervised")
+        metrics = pipeline.train(populated_store, splits, ensemble_type="supervised")
+        assert "val_false_positive_rate" in metrics
 
-    def test_hybrid_requires_semi_splits(self, populated_store, splits):
-        """ensemble_type='hybrid' with unsupervised splits raises."""
-        ensemble = create_default_ensemble(threshold_percentile=95.0)
+    def test_hybrid_works_with_unified_splits(self, populated_store, splits):
+        """ensemble_type='hybrid' works with unified splits (always have jailbreak data)."""
+        ensemble = create_hybrid_ensemble(threshold_percentile=95.0)
         pipeline = VenatorPipeline(ensemble=ensemble, layer=16)
-        with pytest.raises(ValueError, match="requires semi-supervised"):
-            pipeline.train(populated_store, splits, ensemble_type="hybrid")
+        metrics = pipeline.train(populated_store, splits, ensemble_type="hybrid")
+        assert "val_false_positive_rate" in metrics
 
     def test_hybrid_with_semi_splits(self, populated_store, semi_splits):
         ensemble = create_hybrid_ensemble(threshold_percentile=95.0)

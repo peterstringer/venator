@@ -124,41 +124,24 @@ def main() -> None:
     # Load data
     store = ActivationStore(args.store)
     splits = SplitManager.load_splits(args.splits)
-    split_mode = SplitManager.load_mode(args.splits)
     logger.info("Loaded store: %s", store)
-    logger.info("Loaded splits (%s): %s", split_mode.value, {
+    logger.info("Loaded splits: %s", {
         name: s.n_samples for name, s in splits.items()
     })
 
-    # Validate ensemble type vs split mode
-    if args.ensemble_type in ("supervised", "hybrid") and "train_benign" not in splits:
-        logger.error(
-            "ensemble-type '%s' requires semi-supervised splits "
-            "(with train_benign/train_jailbreak keys). "
-            "Use --split-mode semi_supervised in create_splits.py first.",
-            args.ensemble_type,
+    # Get training and validation data (unified split format)
+    X_train = store.get_activations(args.layer, indices=splits["train_benign"].indices.tolist())
+    X_val = store.get_activations(args.layer, indices=splits["val_benign"].indices.tolist())
+    if args.ensemble_type in ("supervised", "hybrid"):
+        X_train_jailbreak = store.get_activations(
+            args.layer, indices=splits["train_jailbreak"].indices.tolist()
         )
-        sys.exit(1)
-
-    # Get training and validation data
-    if "train" in splits:
-        X_train = store.get_activations(args.layer, indices=splits["train"].indices.tolist())
-        X_val = store.get_activations(args.layer, indices=splits["val"].indices.tolist())
+        X_val_jailbreak = store.get_activations(
+            args.layer, indices=splits["val_jailbreak"].indices.tolist()
+        )
+    else:
         X_train_jailbreak = None
         X_val_jailbreak = None
-    else:
-        X_train = store.get_activations(args.layer, indices=splits["train_benign"].indices.tolist())
-        X_val = store.get_activations(args.layer, indices=splits["val_benign"].indices.tolist())
-        if args.ensemble_type in ("supervised", "hybrid"):
-            X_train_jailbreak = store.get_activations(
-                args.layer, indices=splits["train_jailbreak"].indices.tolist()
-            )
-            X_val_jailbreak = store.get_activations(
-                args.layer, indices=splits["val_jailbreak"].indices.tolist()
-            )
-        else:
-            X_train_jailbreak = None
-            X_val_jailbreak = None
 
     logger.info(
         "Training data: layer=%d, n_train=%d, n_val=%d, n_features=%d%s",

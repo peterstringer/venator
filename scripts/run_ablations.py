@@ -98,8 +98,8 @@ def ablate_layers(
         logger.info("Layer ablation: testing layer %d...", layer)
         t0 = time.perf_counter()
 
-        X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
-        X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
+        X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
+        X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
         X_test, labels = _get_test_data(store, splits, layer)
 
         ensemble = DetectorEnsemble(
@@ -130,8 +130,8 @@ def ablate_pca_dims(
     layer: int,
 ) -> list[dict]:
     """Test different PCA dimensionalities on a fixed layer."""
-    X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
-    X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
+    X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
+    X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
     X_test, labels = _get_test_data(store, splits, layer)
 
     results = []
@@ -172,8 +172,8 @@ def ablate_detectors(
     layer: int,
 ) -> list[dict]:
     """Test individual detectors vs the full ensemble."""
-    X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
-    X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
+    X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
+    X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
     X_test, labels = _get_test_data(store, splits, layer)
 
     detector_configs = [

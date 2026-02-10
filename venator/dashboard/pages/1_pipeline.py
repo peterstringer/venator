@@ -20,7 +20,7 @@ from venator.data.prompts import (
     collect_benign_prompts,
     collect_jailbreak_prompts,
 )
-from venator.data.splits import SplitManager, SplitMode
+from venator.data.splits import SplitManager
 from venator.detection.autoencoder import AutoencoderDetector
 from venator.detection.ensemble import (
     DetectorEnsemble,
@@ -135,73 +135,67 @@ def _show_store_summary(store_path: Path) -> None:
 
 
 def _show_split_summary(
-    splits: dict, store: ActivationStore, manager: SplitManager, mode: SplitMode
+    splits: dict, store: ActivationStore, manager: SplitManager
 ) -> None:
-    """Display the split summary table and methodology verification panel."""
+    """Display the unified split summary with visual diagram."""
     n_benign = int((store.get_labels() == 0).sum())
     n_jailbreak = int((store.get_labels() == 1).sum())
 
-    rows = []
-    for name, s in splits.items():
-        if s.contains_jailbreaks:
-            pct_label = "\u2014"
-        else:
-            pct_label = f"{s.n_samples / n_benign * 100:.0f}%" if n_benign > 0 else "0%"
-        jailbreak_flag = "YES (100%)" if s.contains_jailbreaks else "NO"
-        rows.append({
-            "Split": s.name,
-            "N Samples": s.n_samples,
-            "% of Benign": pct_label,
-            "Contains Jailbreaks": jailbreak_flag,
-        })
+    n_tb = splits["train_benign"].n_samples
+    n_tj = splits["train_jailbreak"].n_samples
+    n_vb = splits["val_benign"].n_samples
+    n_vj = splits["val_jailbreak"].n_samples
+    n_eb = splits["test_benign"].n_samples
+    n_ej = splits["test_jailbreak"].n_samples
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    # Visual split diagram
+    st.markdown(f"""```
+YOUR DATA: {n_benign} benign + {n_jailbreak} jailbreak prompts
+
+TRAIN
+ |- {n_tb:>4} benign      -> unsupervised detectors
+ '- {n_tj:>4} jailbreak   -> supervised detectors
+
+VALIDATE
+ |- {n_vb:>4} benign      -> all detectors
+ '- {n_vj:>4} jailbreak   -> all detectors
+
+TEST (never seen in training)
+ |- {n_eb:>4} benign
+ '- {n_ej:>4} jailbreak
+```""")
 
     # Methodology verification
     st.markdown("**Methodology Verification**")
 
     validation_passed = True
     try:
-        manager.validate_splits(splits, store, mode=mode)
+        manager.validate_splits(splits, store)
     except ValueError as e:
         validation_passed = False
         st.error(f"Validation failed: {e}")
 
     if validation_passed:
-        if mode == SplitMode.UNSUPERVISED:
-            st.markdown(":white_check_mark: Training data contains **0 jailbreak prompts**")
-            st.markdown(":white_check_mark: Validation data contains **0 jailbreak prompts**")
-            st.markdown(":white_check_mark: All jailbreak prompts reserved for **test set**")
-        else:
-            n_train_jb = splits["train_jailbreak"].n_samples if "train_jailbreak" in splits else 0
-            n_val_jb = splits["val_jailbreak"].n_samples if "val_jailbreak" in splits else 0
-            n_test_jb = splits["test_jailbreak"].n_samples if "test_jailbreak" in splits else 0
-            st.markdown(
-                f":white_check_mark: Training jailbreaks: **{n_train_jb}** "
-                f"({n_train_jb / n_jailbreak * 100:.0f}% of jailbreaks)" if n_jailbreak > 0
-                else ":white_check_mark: Training jailbreaks: **0**"
-            )
-            st.markdown(
-                f":white_check_mark: Validation jailbreaks: **{n_val_jb}** "
-                f"({n_val_jb / n_jailbreak * 100:.0f}% of jailbreaks)" if n_jailbreak > 0
-                else ":white_check_mark: Validation jailbreaks: **0**"
-            )
-            st.markdown(
-                f":white_check_mark: Test jailbreaks (uncontaminated): **{n_test_jb}** "
-                f"({n_test_jb / n_jailbreak * 100:.0f}% of jailbreaks)" if n_jailbreak > 0
-                else ":white_check_mark: Test jailbreaks: **0**"
-            )
+        st.markdown(
+            f":white_check_mark: Training jailbreaks: **{n_tj}** "
+            f"({n_tj / n_jailbreak * 100:.0f}% of jailbreaks)" if n_jailbreak > 0
+            else ":white_check_mark: Training jailbreaks: **0**"
+        )
+        st.markdown(
+            f":white_check_mark: Test jailbreaks (uncontaminated): **{n_ej}** "
+            f"({n_ej / n_jailbreak * 100:.0f}% of jailbreaks)" if n_jailbreak > 0
+            else ":white_check_mark: Test jailbreaks: **0**"
+        )
         st.markdown(":white_check_mark: No index overlap between splits")
 
         # Sample-to-feature ratio check
-        train_key = "train" if "train" in splits else "train_benign"
-        ratio = splits[train_key].n_samples / config.pca_dims
+        ratio = n_tb / config.pca_dims
         ratio_ok = ratio >= 5.0
         icon = ":white_check_mark:" if ratio_ok else ":warning:"
         quality = "healthy" if ratio_ok else "low"
         st.markdown(
             f"{icon} Sample-to-feature ratio: "
-            f"**{splits[train_key].n_samples}** samples / "
+            f"**{n_tb}** samples / "
             f"**{config.pca_dims}** PCA dims = "
             f"**{ratio:.1f}x** ({quality})"
         )
@@ -536,55 +530,38 @@ with st.expander(_split_title, expanded=state.activations_ready and not state.sp
 
         store = ActivationStore(state.store_path)
         splits = SplitManager.load_splits(state.splits_path)
-        loaded_mode = SplitManager.load_mode(state.splits_path)
         manager = SplitManager(seed=config.random_seed)
-        _show_split_summary(splits, store, manager, loaded_mode)
+        _show_split_summary(splits, store, manager)
 
         if st.button("Re-split", key="re_split"):
             state.reset_from(3)
             st.rerun()
     else:
-        st.markdown("Create train/validation/test splits with proper methodology constraints.")
+        st.markdown(
+            "Create train/validation/test splits. One split serves all detector types — "
+            "the pipeline routes data automatically."
+        )
 
-        # Split mode selector
-        mode_col1, mode_col2 = st.columns(2)
-        with mode_col1:
-            split_mode_str = st.radio(
-                "Split Mode",
-                options=["unsupervised", "semi_supervised"],
-                format_func=lambda x: "Unsupervised" if x == "unsupervised" else "Semi-Supervised",
-                horizontal=True,
-                key="split_mode_radio",
-                help=(
-                    "**Unsupervised**: jailbreaks reserved for test set only. "
-                    "**Semi-Supervised**: a small labeled jailbreak fraction in train/val."
-                ),
-            )
-        split_mode = SplitMode(split_mode_str)
-        is_semi = split_mode == SplitMode.SEMI_SUPERVISED
+        store = ActivationStore(state.store_path)
+        n_jailbreak_total = int((store.get_labels() == 1).sum())
 
-        if is_semi:
-            store = ActivationStore(state.store_path)
-            n_jailbreak_total = int((store.get_labels() == 1).sum())
-
-            if n_jailbreak_total == 0:
-                st.error(
-                    "No jailbreak prompts found. Semi-supervised mode requires labeled jailbreaks."
-                )
-                st.stop()
-
-            ss_col1, ss_col2 = st.columns(2)
-            with ss_col1:
+        # Jailbreak allocation (shown only when jailbreaks exist)
+        if n_jailbreak_total > 0:
+            st.markdown("**Jailbreak allocation**")
+            jb_col1, jb_col2 = st.columns(2)
+            with jb_col1:
                 jailbreak_train_frac = st.slider(
-                    "Labeled jailbreak fraction (training)",
+                    "Jailbreak fraction (training)",
                     min_value=0.05, max_value=0.30, value=0.15, step=0.05,
                     key="jb_train_frac",
+                    help="Small labeled subset for supervised detectors (e.g. linear probe).",
                 )
-            with ss_col2:
+            with jb_col2:
                 jailbreak_val_frac = st.slider(
-                    "Labeled jailbreak fraction (validation)",
+                    "Jailbreak fraction (validation)",
                     min_value=0.05, max_value=0.30, value=0.15, step=0.05,
                     key="jb_val_frac",
+                    help="Used for threshold calibration with labeled data.",
                 )
 
             jailbreak_test_frac = round(1.0 - jailbreak_train_frac - jailbreak_val_frac, 2)
@@ -601,8 +578,12 @@ with st.expander(_split_title, expanded=state.activations_ready and not state.sp
                 f"**{n_val_jb}** for validation, "
                 f"**{n_test_jb}** reserved for uncontaminated testing."
             )
+        else:
+            jailbreak_train_frac = 0.15
+            jailbreak_val_frac = 0.15
 
         # Benign split fractions
+        st.markdown("**Benign allocation**")
         cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
         with cfg_col1:
             train_frac = st.slider(
@@ -627,35 +608,29 @@ with st.expander(_split_title, expanded=state.activations_ready and not state.sp
             st.stop()
 
         if st.button("Create Splits", type="primary", key="create_splits"):
-            store = ActivationStore(state.store_path)
             manager = SplitManager(seed=int(seed))
 
             with st.spinner("Creating splits..."):
                 splits = manager.create_splits(
                     store,
-                    mode=split_mode,
                     benign_train_frac=train_frac,
                     benign_val_frac=val_frac,
+                    jailbreak_train_frac=jailbreak_train_frac,
+                    jailbreak_val_frac=jailbreak_val_frac,
                 )
 
-            _show_split_summary(splits, store, manager, split_mode)
+            _show_split_summary(splits, store, manager)
 
             st.session_state["_splits"] = splits
             st.session_state["_split_manager"] = manager
-            st.session_state["_split_mode"] = split_mode
 
         if st.session_state.get("_splits") is not None:
             if st.button("Save Splits", type="primary", key="save_splits"):
                 splits = st.session_state["_splits"]
                 manager = st.session_state["_split_manager"]
-                saved_mode = st.session_state.get("_split_mode", SplitMode.UNSUPERVISED)
 
-                if saved_mode == SplitMode.SEMI_SUPERVISED:
-                    splits_path = config.data_dir / "splits_semi.json"
-                else:
-                    splits_path = config.data_dir / "splits.json"
-
-                manager.save_splits(splits, splits_path, mode=saved_mode)
+                splits_path = config.data_dir / "splits.json"
+                manager.save_splits(splits, splits_path)
 
                 state.reset_from(3)
                 state.splits_path = splits_path
@@ -698,16 +673,15 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
             "Train anomaly detection ensemble. Supports unsupervised, supervised, and hybrid."
         )
 
-        # Detect split mode
         splits = SplitManager.load_splits(state.splits_path)
-        split_mode = SplitManager.load_mode(state.splits_path)
-        is_semi = split_mode == SplitMode.SEMI_SUPERVISED
-
         store = ActivationStore(state.store_path)
         available_layers = store.layers
 
+        # Determine if labeled jailbreaks are available for supervised training
+        has_labeled_jailbreaks = splits["train_jailbreak"].n_samples > 0
+
         # Ensemble type selector
-        if is_semi:
+        if has_labeled_jailbreaks:
             ensemble_type = st.radio(
                 "Ensemble Type",
                 options=["unsupervised", "supervised", "hybrid"],
@@ -723,7 +697,7 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
             )
         else:
             ensemble_type = "unsupervised"
-            st.info("Using **unsupervised** ensemble (splits are unsupervised).")
+            st.info("Using **unsupervised** ensemble (no labeled jailbreaks in training split).")
 
         st.markdown("**Detectors in this ensemble:**")
         for det_name, det_type, det_weight in _ENSEMBLE_DETECTORS[ensemble_type]:
@@ -782,25 +756,19 @@ with st.expander(_train_title, expanded=state.splits_ready and not state.model_r
                 st.stop()
 
         if st.button("Train Ensemble", type="primary", key="train_ensemble"):
-            # Get training data
-            if "train" in splits:
-                X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
-                X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
+            # Get training data (unified 6-key format)
+            X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
+            X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
+            if ensemble_type in ("supervised", "hybrid"):
+                X_train_jailbreak = store.get_activations(
+                    layer, indices=splits["train_jailbreak"].indices.tolist()
+                )
+                X_val_jailbreak = store.get_activations(
+                    layer, indices=splits["val_jailbreak"].indices.tolist()
+                )
+            else:
                 X_train_jailbreak = None
                 X_val_jailbreak = None
-            else:
-                X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
-                X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
-                if ensemble_type in ("supervised", "hybrid"):
-                    X_train_jailbreak = store.get_activations(
-                        layer, indices=splits["train_jailbreak"].indices.tolist()
-                    )
-                    X_val_jailbreak = store.get_activations(
-                        layer, indices=splits["val_jailbreak"].indices.tolist()
-                    )
-                else:
-                    X_train_jailbreak = None
-                    X_val_jailbreak = None
 
             # Build ensemble
             if ensemble_type == "unsupervised":

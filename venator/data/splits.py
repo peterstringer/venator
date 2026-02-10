@@ -1,38 +1,31 @@
-"""Train/validation/test splitting with strict methodology constraints.
+"""Unified data splitting for all detector types.
 
-Supports two split modes:
+Creates a single split that serves every detector:
 
-**UNSUPERVISED** (original methodology):
-- Training set: benign prompts ONLY (detector learns "normal")
-- Validation set: benign prompts ONLY (for threshold tuning)
-- Test set: held-out benign + ALL jailbreak prompts
-- Jailbreak prompts NEVER appear in training or validation data.
+    Unsupervised: fit(train_benign) → calibrate(val_benign) → test(test_*)
+    Supervised:   fit(train_benign + train_jailbreak) → calibrate(val_*) → test(test_*)
+    Ensemble:     each component uses its own path above → combine → test(test_*)
 
-Split strategy (benign indices only):
-    train:          70% of benign prompts
-    val:            15% of benign prompts
-    test_benign:    15% of benign prompts
-    test_jailbreak: ALL jailbreak prompts (100%)
+The split always produces 6 pieces:
+    train_benign       — For unsupervised detector training (learn "normal")
+    train_jailbreak    — For supervised detector training (labeled examples)
+    val_benign         — For threshold calibration (both detector types)
+    val_jailbreak      — For threshold calibration (supervised + ensemble)
+    test_benign        — For final evaluation (NEVER used in training)
+    test_jailbreak     — For final evaluation (NEVER used in training)
 
-**SEMI_SUPERVISED** (few-shot labeled jailbreaks):
-- Training and validation sets include a small labeled jailbreak subset.
-- 70% of jailbreaks are reserved for uncontaminated testing.
-- Enables contrastive/few-shot detection methods.
+Default allocations:
+    Benign:    70% train / 15% val / 15% test
+    Jailbreak: 15% train / 15% val / 70% test
 
-Split strategy:
-    train_benign:    70% of benign prompts
-    train_jailbreak: 15% of jailbreak prompts
-    val_benign:      15% of benign prompts
-    val_jailbreak:   15% of jailbreak prompts
-    test_benign:     15% of benign prompts (remainder)
-    test_jailbreak:  70% of jailbreak prompts (remainder)
+Split once, train anything. The pipeline routes data to the right detector.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -46,16 +39,17 @@ logger = logging.getLogger(__name__)
 class SplitMode(str, Enum):
     """Split methodology mode.
 
-    UNSUPERVISED: Train/val contain only benign prompts; all jailbreaks
-        are reserved for testing. This is the standard unsupervised
-        anomaly detection setup.
-    SEMI_SUPERVISED: A small fraction of labeled jailbreaks is included
-        in train and val splits, with the majority reserved for testing.
-        Enables contrastive or few-shot detection methods.
+    UNSUPERVISED: Legacy mode — train/val contain only benign prompts.
+        Kept for backward compatibility with old split files.
+    SEMI_SUPERVISED: Legacy name for the unified split format.
+        All new splits use this format.
+    UNIFIED: The current standard — always produces 6 pieces.
+        Equivalent to SEMI_SUPERVISED in output format.
     """
 
     UNSUPERVISED = "unsupervised"
     SEMI_SUPERVISED = "semi_supervised"
+    UNIFIED = "unified"
 
 
 @dataclass
@@ -63,7 +57,7 @@ class DataSplit:
     """A named data split with indices into an ActivationStore.
 
     Attributes:
-        name: Split identifier ("train", "val", "test_benign", "test_jailbreak").
+        name: Split identifier (e.g. "train_benign", "test_jailbreak").
         indices: Row indices into the activation store (sorted).
         n_samples: Number of samples in this split.
         contains_jailbreaks: Whether this split includes jailbreak prompts.
@@ -79,173 +73,131 @@ class DataSplit:
         self.n_samples = len(self.indices)
 
 
-class SplitManager:
-    """Creates and manages train/val/test splits with strict methodology.
+@dataclass
+class UnifiedSplit:
+    """One split that serves every detector type.
 
-    Supports two modes:
-    - UNSUPERVISED: Jailbreaks appear ONLY in the test set.
-    - SEMI_SUPERVISED: A small labeled jailbreak fraction is included in
-      train/val, with the majority reserved for testing.
+    Pieces:
+        train_benign       — For unsupervised detector training (learn "normal")
+        train_jailbreak    — For supervised detector training (labeled examples)
+        val_benign         — For threshold calibration (both detector types)
+        val_jailbreak      — For threshold calibration (supervised + ensemble)
+        test_benign        — For final evaluation (NEVER used in training)
+        test_jailbreak     — For final evaluation (NEVER used in training)
 
-    Args:
-        seed: Random seed for reproducible shuffling.
+    How each detector type uses the split:
+        Unsupervised: fit(train_benign) → calibrate(val_benign) → test(test_*)
+        Supervised:   fit(train_benign + train_jailbreak) → calibrate(val_*) → test(test_*)
+        Ensemble:     each component uses its own path above → combine → test(test_*)
     """
 
-    def __init__(self, seed: int = 42) -> None:
-        self.seed = seed
+    train_benign_indices: np.ndarray
+    train_jailbreak_indices: np.ndarray
+    val_benign_indices: np.ndarray
+    val_jailbreak_indices: np.ndarray
+    test_benign_indices: np.ndarray
+    test_jailbreak_indices: np.ndarray
 
-    def create_splits(
-        self,
-        store: ActivationStore,
-        mode: SplitMode = SplitMode.SEMI_SUPERVISED,
-        benign_train_frac: float = 0.70,
-        benign_val_frac: float = 0.15,
-        jailbreak_train_frac: float = 0.15,
-        jailbreak_val_frac: float = 0.15,
-    ) -> dict[str, DataSplit]:
-        """Create splits from an activation store.
+    def __post_init__(self) -> None:
+        self.train_benign_indices = np.asarray(self.train_benign_indices, dtype=np.int64)
+        self.train_jailbreak_indices = np.asarray(self.train_jailbreak_indices, dtype=np.int64)
+        self.val_benign_indices = np.asarray(self.val_benign_indices, dtype=np.int64)
+        self.val_jailbreak_indices = np.asarray(self.val_jailbreak_indices, dtype=np.int64)
+        self.test_benign_indices = np.asarray(self.test_benign_indices, dtype=np.int64)
+        self.test_jailbreak_indices = np.asarray(self.test_jailbreak_indices, dtype=np.int64)
 
-        Args:
-            store: ActivationStore containing prompts with labels.
-            mode: Split methodology — UNSUPERVISED or SEMI_SUPERVISED.
-            benign_train_frac: Fraction of benign prompts for training.
-            benign_val_frac: Fraction of benign prompts for validation.
-            jailbreak_train_frac: Fraction of jailbreaks for training
-                (SEMI_SUPERVISED only, ignored in UNSUPERVISED).
-            jailbreak_val_frac: Fraction of jailbreaks for validation
-                (SEMI_SUPERVISED only, ignored in UNSUPERVISED).
-
-        Returns:
-            Dict mapping split name -> DataSplit.
-
-        Raises:
-            ValueError: If fractions are invalid or store is empty.
-        """
-        if mode == SplitMode.UNSUPERVISED:
-            return self._create_unsupervised_splits(
-                store, benign_train_frac, benign_val_frac,
-            )
-        else:
-            return self._create_semi_supervised_splits(
-                store,
-                benign_train_frac,
-                benign_val_frac,
-                jailbreak_train_frac,
-                jailbreak_val_frac,
-            )
-
-    def _create_unsupervised_splits(
-        self,
-        store: ActivationStore,
-        train_frac: float,
-        val_frac: float,
-    ) -> dict[str, DataSplit]:
-        """Create unsupervised splits — jailbreaks only in test."""
-        test_frac = 1.0 - train_frac - val_frac
-
-        if not (0 < train_frac < 1 and 0 < val_frac < 1 and test_frac > 0):
-            raise ValueError(
-                f"Invalid fractions: train={train_frac}, val={val_frac}, "
-                f"test={test_frac:.4f}. All must be positive and sum to 1."
-            )
-        if abs(train_frac + val_frac + test_frac - 1.0) > 1e-9:
-            raise ValueError(
-                f"Fractions must sum to 1.0, got {train_frac + val_frac + test_frac:.6f}"
-            )
-
-        benign_idx, jailbreak_idx = store.split_by_labels()
-
-        if len(benign_idx) == 0:
-            raise ValueError("Store contains no benign prompts — cannot create splits")
-
-        # Shuffle benign indices deterministically
-        rng = np.random.default_rng(self.seed)
-        rng.shuffle(benign_idx)
-
-        # Compute split boundaries
-        n_benign = len(benign_idx)
-        n_train = max(1, int(round(n_benign * train_frac)))
-        n_val = max(1, int(round(n_benign * val_frac)))
-        # test_benign gets the remainder to avoid off-by-one from rounding
-        n_test_benign = n_benign - n_train - n_val
-
-        if n_test_benign < 1:
-            # With very few samples, ensure at least 1 in each split
-            n_test_benign = 1
-            n_train = n_benign - n_val - n_test_benign
-            if n_train < 1:
-                n_train = 1
-                n_val = n_benign - n_train - n_test_benign
-                if n_val < 1:
-                    raise ValueError(
-                        f"Too few benign samples ({n_benign}) to create 3 splits. "
-                        "Need at least 3 benign prompts."
-                    )
-
-        train_indices = np.sort(benign_idx[:n_train])
-        val_indices = np.sort(benign_idx[n_train : n_train + n_val])
-        test_benign_indices = np.sort(benign_idx[n_train + n_val :])
-
-        splits = {
-            "train": DataSplit(
-                name="train",
-                indices=train_indices,
-                n_samples=len(train_indices),
+    def to_split_dict(self) -> dict[str, DataSplit]:
+        """Convert to the dict[str, DataSplit] format used by consumers."""
+        return {
+            "train_benign": DataSplit(
+                name="train_benign",
+                indices=self.train_benign_indices,
+                n_samples=len(self.train_benign_indices),
                 contains_jailbreaks=False,
             ),
-            "val": DataSplit(
-                name="val",
-                indices=val_indices,
-                n_samples=len(val_indices),
+            "train_jailbreak": DataSplit(
+                name="train_jailbreak",
+                indices=self.train_jailbreak_indices,
+                n_samples=len(self.train_jailbreak_indices),
+                contains_jailbreaks=True,
+            ),
+            "val_benign": DataSplit(
+                name="val_benign",
+                indices=self.val_benign_indices,
+                n_samples=len(self.val_benign_indices),
                 contains_jailbreaks=False,
+            ),
+            "val_jailbreak": DataSplit(
+                name="val_jailbreak",
+                indices=self.val_jailbreak_indices,
+                n_samples=len(self.val_jailbreak_indices),
+                contains_jailbreaks=True,
             ),
             "test_benign": DataSplit(
                 name="test_benign",
-                indices=test_benign_indices,
-                n_samples=len(test_benign_indices),
+                indices=self.test_benign_indices,
+                n_samples=len(self.test_benign_indices),
                 contains_jailbreaks=False,
             ),
             "test_jailbreak": DataSplit(
                 name="test_jailbreak",
-                indices=np.sort(jailbreak_idx),
-                n_samples=len(jailbreak_idx),
+                indices=self.test_jailbreak_indices,
+                n_samples=len(self.test_jailbreak_indices),
                 contains_jailbreaks=True,
             ),
         }
 
-        # Validate immediately — fail fast if something is wrong
-        self.validate_splits(splits, store, mode=SplitMode.UNSUPERVISED)
 
-        logger.info(
-            "Created UNSUPERVISED splits: train=%d, val=%d, "
-            "test_benign=%d, test_jailbreak=%d",
-            splits["train"].n_samples,
-            splits["val"].n_samples,
-            splits["test_benign"].n_samples,
-            splits["test_jailbreak"].n_samples,
+def create_unified_split(
+    benign_indices: np.ndarray,
+    jailbreak_indices: np.ndarray,
+    benign_train_frac: float = 0.70,
+    benign_val_frac: float = 0.15,
+    jailbreak_train_frac: float = 0.15,
+    jailbreak_val_frac: float = 0.15,
+    seed: int = 42,
+) -> UnifiedSplit:
+    """Create one split that all detectors can use.
+
+    Default allocations:
+        Benign:    70% train / 15% val / 15% test
+        Jailbreak: 15% train / 15% val / 70% test
+
+    Args:
+        benign_indices: Store indices of benign prompts.
+        jailbreak_indices: Store indices of jailbreak prompts.
+        benign_train_frac: Fraction of benign prompts for training.
+        benign_val_frac: Fraction of benign prompts for validation.
+        jailbreak_train_frac: Fraction of jailbreaks for training.
+        jailbreak_val_frac: Fraction of jailbreaks for validation.
+        seed: Random seed for reproducible shuffling.
+
+    Returns:
+        A UnifiedSplit with all 6 index arrays.
+
+    Raises:
+        ValueError: If fractions are invalid or insufficient data.
+    """
+    benign_indices = np.asarray(benign_indices, dtype=np.int64).copy()
+    jailbreak_indices = np.asarray(jailbreak_indices, dtype=np.int64).copy()
+
+    n_benign = len(benign_indices)
+    n_jailbreak = len(jailbreak_indices)
+
+    if n_benign == 0:
+        raise ValueError("No benign prompts — cannot create splits")
+
+    # Validate benign fractions
+    benign_test_frac = 1.0 - benign_train_frac - benign_val_frac
+    if not (0 < benign_train_frac < 1 and 0 < benign_val_frac < 1 and benign_test_frac > 0):
+        raise ValueError(
+            f"Invalid benign fractions: train={benign_train_frac}, "
+            f"val={benign_val_frac}, test={benign_test_frac:.4f}. "
+            "All must be positive and sum to 1."
         )
 
-        return splits
-
-    def _create_semi_supervised_splits(
-        self,
-        store: ActivationStore,
-        benign_train_frac: float,
-        benign_val_frac: float,
-        jailbreak_train_frac: float,
-        jailbreak_val_frac: float,
-    ) -> dict[str, DataSplit]:
-        """Create semi-supervised splits — small jailbreak fraction in train/val."""
-        # Validate benign fractions
-        benign_test_frac = 1.0 - benign_train_frac - benign_val_frac
-        if not (0 < benign_train_frac < 1 and 0 < benign_val_frac < 1 and benign_test_frac > 0):
-            raise ValueError(
-                f"Invalid benign fractions: train={benign_train_frac}, "
-                f"val={benign_val_frac}, test={benign_test_frac:.4f}. "
-                "All must be positive and sum to 1."
-            )
-
-        # Validate jailbreak fractions
+    # Validate jailbreak fractions (only if jailbreaks exist)
+    if n_jailbreak > 0:
         jailbreak_test_frac = 1.0 - jailbreak_train_frac - jailbreak_val_frac
         if not (0 <= jailbreak_train_frac < 1 and 0 <= jailbreak_val_frac < 1 and jailbreak_test_frac > 0):
             raise ValueError(
@@ -260,40 +212,31 @@ class SplitManager:
                 "50% of jailbreaks must be reserved for uncontaminated testing."
             )
 
-        benign_idx, jailbreak_idx = store.split_by_labels()
+    # Shuffle deterministically
+    rng = np.random.default_rng(seed)
+    rng.shuffle(benign_indices)
+    if n_jailbreak > 0:
+        rng.shuffle(jailbreak_indices)
 
-        if len(benign_idx) == 0:
-            raise ValueError("Store contains no benign prompts — cannot create splits")
-        if len(jailbreak_idx) == 0:
-            raise ValueError(
-                "Store contains no jailbreak prompts — cannot create "
-                "semi-supervised splits. Use UNSUPERVISED mode instead."
-            )
+    # --- Benign splits ---
+    n_b_train = max(1, int(round(n_benign * benign_train_frac)))
+    n_b_val = max(1, int(round(n_benign * benign_val_frac)))
+    n_b_test = n_benign - n_b_train - n_b_val
 
-        rng = np.random.default_rng(self.seed)
-        rng.shuffle(benign_idx)
-        rng.shuffle(jailbreak_idx)
+    if n_b_test < 1:
+        n_b_test = 1
+        n_b_train = n_benign - n_b_val - n_b_test
+        if n_b_train < 1:
+            n_b_train = 1
+            n_b_val = n_benign - n_b_train - n_b_test
+            if n_b_val < 1:
+                raise ValueError(
+                    f"Too few benign samples ({n_benign}) to create 3 splits. "
+                    "Need at least 3 benign prompts."
+                )
 
-        # --- Benign splits ---
-        n_benign = len(benign_idx)
-        n_b_train = max(1, int(round(n_benign * benign_train_frac)))
-        n_b_val = max(1, int(round(n_benign * benign_val_frac)))
-        n_b_test = n_benign - n_b_train - n_b_val
-
-        if n_b_test < 1:
-            n_b_test = 1
-            n_b_train = n_benign - n_b_val - n_b_test
-            if n_b_train < 1:
-                n_b_train = 1
-                n_b_val = n_benign - n_b_train - n_b_test
-                if n_b_val < 1:
-                    raise ValueError(
-                        f"Too few benign samples ({n_benign}) to create 3 splits. "
-                        "Need at least 3 benign prompts."
-                    )
-
-        # --- Jailbreak splits ---
-        n_jailbreak = len(jailbreak_idx)
+    # --- Jailbreak splits ---
+    if n_jailbreak > 0:
         n_j_train = max(0, int(round(n_jailbreak * jailbreak_train_frac)))
         n_j_val = max(0, int(round(n_jailbreak * jailbreak_val_frac)))
         n_j_test = n_jailbreak - n_j_train - n_j_val
@@ -304,61 +247,100 @@ class SplitManager:
                 f"with train_frac={jailbreak_train_frac}, val_frac={jailbreak_val_frac}. "
                 "Reduce jailbreak train/val fractions or add more jailbreak prompts."
             )
+    else:
+        n_j_train = 0
+        n_j_val = 0
 
-        # Build splits
-        splits = {
-            "train_benign": DataSplit(
-                name="train_benign",
-                indices=np.sort(benign_idx[:n_b_train]),
-                n_samples=n_b_train,
-                contains_jailbreaks=False,
-            ),
-            "train_jailbreak": DataSplit(
-                name="train_jailbreak",
-                indices=np.sort(jailbreak_idx[:n_j_train]),
-                n_samples=n_j_train,
-                contains_jailbreaks=True,
-            ),
-            "val_benign": DataSplit(
-                name="val_benign",
-                indices=np.sort(benign_idx[n_b_train : n_b_train + n_b_val]),
-                n_samples=n_b_val,
-                contains_jailbreaks=False,
-            ),
-            "val_jailbreak": DataSplit(
-                name="val_jailbreak",
-                indices=np.sort(jailbreak_idx[n_j_train : n_j_train + n_j_val]),
-                n_samples=n_j_val,
-                contains_jailbreaks=True,
-            ),
-            "test_benign": DataSplit(
-                name="test_benign",
-                indices=np.sort(benign_idx[n_b_train + n_b_val :]),
-                n_samples=n_b_test,
-                contains_jailbreaks=False,
-            ),
-            "test_jailbreak": DataSplit(
-                name="test_jailbreak",
-                indices=np.sort(jailbreak_idx[n_j_train + n_j_val :]),
-                n_samples=n_j_test,
-                contains_jailbreaks=True,
-            ),
-        }
+    split = UnifiedSplit(
+        train_benign_indices=np.sort(benign_indices[:n_b_train]),
+        train_jailbreak_indices=np.sort(jailbreak_indices[:n_j_train]),
+        val_benign_indices=np.sort(benign_indices[n_b_train : n_b_train + n_b_val]),
+        val_jailbreak_indices=np.sort(jailbreak_indices[n_j_train : n_j_train + n_j_val]),
+        test_benign_indices=np.sort(benign_indices[n_b_train + n_b_val :]),
+        test_jailbreak_indices=np.sort(jailbreak_indices[n_j_train + n_j_val :]),
+    )
 
-        self.validate_splits(splits, store, mode=SplitMode.SEMI_SUPERVISED)
+    logger.info(
+        "Created unified split: "
+        "train_benign=%d, train_jailbreak=%d, "
+        "val_benign=%d, val_jailbreak=%d, "
+        "test_benign=%d, test_jailbreak=%d",
+        len(split.train_benign_indices),
+        len(split.train_jailbreak_indices),
+        len(split.val_benign_indices),
+        len(split.val_jailbreak_indices),
+        len(split.test_benign_indices),
+        len(split.test_jailbreak_indices),
+    )
 
-        logger.info(
-            "Created SEMI_SUPERVISED splits: "
-            "train_benign=%d, train_jailbreak=%d, "
-            "val_benign=%d, val_jailbreak=%d, "
-            "test_benign=%d, test_jailbreak=%d",
-            splits["train_benign"].n_samples,
-            splits["train_jailbreak"].n_samples,
-            splits["val_benign"].n_samples,
-            splits["val_jailbreak"].n_samples,
-            splits["test_benign"].n_samples,
-            splits["test_jailbreak"].n_samples,
+    return split
+
+
+class SplitManager:
+    """Creates and manages train/val/test splits.
+
+    The primary API is ``create_splits()`` which always produces a unified
+    split with 6 keys (train_benign, train_jailbreak, val_benign,
+    val_jailbreak, test_benign, test_jailbreak).
+
+    Each detector type picks the pieces it needs:
+    - Unsupervised: train_benign only
+    - Supervised: train_benign + train_jailbreak
+    - Threshold calibration: val_benign + val_jailbreak
+
+    Args:
+        seed: Random seed for reproducible shuffling.
+    """
+
+    def __init__(self, seed: int = 42) -> None:
+        self.seed = seed
+
+    def create_splits(
+        self,
+        store: ActivationStore,
+        benign_train_frac: float = 0.70,
+        benign_val_frac: float = 0.15,
+        jailbreak_train_frac: float = 0.15,
+        jailbreak_val_frac: float = 0.15,
+        # Backward compat: mode is accepted but ignored (always produces unified)
+        mode: SplitMode | None = None,
+    ) -> dict[str, DataSplit]:
+        """Create splits from an activation store.
+
+        Always produces the unified 6-key format regardless of mode parameter.
+        The ``mode`` parameter is accepted for backward compatibility but is
+        ignored — all splits are unified.
+
+        Args:
+            store: ActivationStore containing prompts with labels.
+            benign_train_frac: Fraction of benign prompts for training.
+            benign_val_frac: Fraction of benign prompts for validation.
+            jailbreak_train_frac: Fraction of jailbreaks for training.
+            jailbreak_val_frac: Fraction of jailbreaks for validation.
+            mode: Ignored. Kept for backward compatibility.
+
+        Returns:
+            Dict mapping split name -> DataSplit (always 6 keys).
+
+        Raises:
+            ValueError: If fractions are invalid or store is empty.
+        """
+        benign_idx, jailbreak_idx = store.split_by_labels()
+
+        unified = create_unified_split(
+            benign_indices=benign_idx,
+            jailbreak_indices=jailbreak_idx,
+            benign_train_frac=benign_train_frac,
+            benign_val_frac=benign_val_frac,
+            jailbreak_train_frac=jailbreak_train_frac,
+            jailbreak_val_frac=jailbreak_val_frac,
+            seed=self.seed,
         )
+
+        splits = unified.to_split_dict()
+
+        # Validate immediately — fail fast if something is wrong
+        self.validate_splits(splits, store)
 
         return splits
 
@@ -366,90 +348,74 @@ class SplitManager:
         self,
         splits: dict[str, DataSplit],
         store: ActivationStore,
-        mode: SplitMode = SplitMode.UNSUPERVISED,
+        mode: SplitMode | None = None,
     ) -> None:
         """Verify split integrity against the activation store.
 
         Raises ValueError if any methodology constraint is violated.
 
-        Checks (UNSUPERVISED):
-            1. Train labels are all 0 (benign).
-            2. Val labels are all 0 (benign).
-            3. Test_jailbreak labels are all 1 (jailbreak).
-            4. No index appears in multiple splits.
-            5. All store indices are covered exactly once.
-
-        Checks (SEMI_SUPERVISED):
+        Checks:
             1. Benign splits contain only benign labels.
             2. Jailbreak splits contain only jailbreak labels.
             3. No index appears in multiple splits.
             4. All store indices are covered exactly once.
+
+        Args:
+            splits: Dict of split name -> DataSplit.
+            store: The ActivationStore these splits reference.
+            mode: Ignored. Kept for backward compatibility.
         """
         labels = store.get_labels()
 
-        if mode == SplitMode.UNSUPERVISED:
-            # --- Check 1 & 2: No jailbreaks in train or val ---
-            for split_name in ("train", "val"):
-                if split_name not in splits:
-                    continue
-                split = splits[split_name]
-                if split.n_samples == 0:
-                    continue
-                split_labels = labels[split.indices]
-                n_jailbreak = int(np.sum(split_labels == 1))
-                if n_jailbreak > 0:
-                    raise ValueError(
-                        f"METHODOLOGY VIOLATION: {split_name} split contains "
-                        f"{n_jailbreak} jailbreak prompts. Training and validation "
-                        "must contain ONLY benign prompts."
-                    )
+        # Benign splits must contain only benign labels
+        for split_name in ("train_benign", "val_benign", "test_benign"):
+            if split_name not in splits:
+                continue
+            split = splits[split_name]
+            if split.n_samples == 0:
+                continue
+            split_labels = labels[split.indices]
+            n_jailbreak = int(np.sum(split_labels == 1))
+            if n_jailbreak > 0:
+                raise ValueError(
+                    f"LABEL MISMATCH: {split_name} split contains "
+                    f"{n_jailbreak} jailbreak prompts but should contain "
+                    "only benign prompts."
+                )
 
-            # --- Check 3: Test_jailbreak contains only jailbreaks ---
-            if "test_jailbreak" in splits:
-                split = splits["test_jailbreak"]
-                if split.n_samples > 0:
-                    split_labels = labels[split.indices]
-                    n_benign = int(np.sum(split_labels == 0))
-                    if n_benign > 0:
-                        raise ValueError(
-                            f"test_jailbreak split contains {n_benign} benign prompts. "
-                            "It should contain ONLY jailbreak prompts."
-                        )
+        # Jailbreak splits must contain only jailbreak labels
+        for split_name in ("train_jailbreak", "val_jailbreak", "test_jailbreak"):
+            if split_name not in splits:
+                continue
+            split = splits[split_name]
+            if split.n_samples == 0:
+                continue
+            split_labels = labels[split.indices]
+            n_benign = int(np.sum(split_labels == 0))
+            if n_benign > 0:
+                raise ValueError(
+                    f"LABEL MISMATCH: {split_name} split contains "
+                    f"{n_benign} benign prompts but should contain "
+                    "only jailbreak prompts."
+                )
 
-        else:  # SEMI_SUPERVISED
-            # Benign splits must contain only benign labels
-            for split_name in ("train_benign", "val_benign", "test_benign"):
-                if split_name not in splits:
-                    continue
-                split = splits[split_name]
-                if split.n_samples == 0:
-                    continue
-                split_labels = labels[split.indices]
-                n_jailbreak = int(np.sum(split_labels == 1))
-                if n_jailbreak > 0:
-                    raise ValueError(
-                        f"LABEL MISMATCH: {split_name} split contains "
-                        f"{n_jailbreak} jailbreak prompts but should contain "
-                        "only benign prompts."
-                    )
+        # Also validate legacy unsupervised format if present
+        for split_name in ("train", "val"):
+            if split_name not in splits:
+                continue
+            split = splits[split_name]
+            if split.n_samples == 0:
+                continue
+            split_labels = labels[split.indices]
+            n_jailbreak = int(np.sum(split_labels == 1))
+            if n_jailbreak > 0:
+                raise ValueError(
+                    f"METHODOLOGY VIOLATION: {split_name} split contains "
+                    f"{n_jailbreak} jailbreak prompts. Training and validation "
+                    "must contain ONLY benign prompts."
+                )
 
-            # Jailbreak splits must contain only jailbreak labels
-            for split_name in ("train_jailbreak", "val_jailbreak", "test_jailbreak"):
-                if split_name not in splits:
-                    continue
-                split = splits[split_name]
-                if split.n_samples == 0:
-                    continue
-                split_labels = labels[split.indices]
-                n_benign = int(np.sum(split_labels == 0))
-                if n_benign > 0:
-                    raise ValueError(
-                        f"LABEL MISMATCH: {split_name} split contains "
-                        f"{n_benign} benign prompts but should contain "
-                        "only jailbreak prompts."
-                    )
-
-        # --- No index overlap (both modes) ---
+        # --- No index overlap ---
         all_indices: list[np.ndarray] = []
         for split in splits.values():
             all_indices.append(split.indices)
@@ -461,7 +427,7 @@ class SplitManager:
                 "appear in exactly one split."
             )
 
-        # --- Full coverage (both modes) ---
+        # --- Full coverage ---
         n_total = store.n_prompts
         if len(combined) != n_total:
             raise ValueError(
@@ -477,24 +443,23 @@ class SplitManager:
         self,
         splits: dict[str, DataSplit],
         path: Path | str,
-        mode: SplitMode = SplitMode.UNSUPERVISED,
+        mode: SplitMode | None = None,
     ) -> None:
         """Save split definitions as JSON.
 
         Stores only indices and metadata — not the activation data itself.
-        The splits can be reloaded and applied to the same ActivationStore.
 
         Args:
             splits: Dict of split name -> DataSplit.
             path: Output JSON file path.
-            mode: The SplitMode used to create these splits.
+            mode: Ignored. All new saves use "unified" mode.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
             "seed": self.seed,
-            "mode": mode.value,
+            "mode": SplitMode.UNIFIED.value,
             "splits": {
                 name: {
                     "name": split.name,
@@ -509,17 +474,22 @@ class SplitManager:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
-        logger.info("Saved %s split definitions to %s", mode.value, path)
+        logger.info("Saved unified split definitions to %s", path)
 
     @classmethod
     def load_splits(cls, path: Path | str) -> dict[str, DataSplit]:
         """Load split definitions from JSON.
 
+        Handles both old (unsupervised 4-key) and new (unified 6-key) formats.
+        Old 4-key format is automatically converted to the 6-key format by
+        mapping "train" -> "train_benign" and "val" -> "val_benign", with
+        empty train_jailbreak and val_jailbreak arrays.
+
         Args:
             path: Path to the JSON file saved by save_splits.
 
         Returns:
-            Dict mapping split name -> DataSplit.
+            Dict mapping split name -> DataSplit (always 6 keys).
         """
         path = Path(path)
         with open(path, "r", encoding="utf-8") as f:
@@ -534,6 +504,49 @@ class SplitManager:
                 contains_jailbreaks=info["contains_jailbreaks"],
             )
 
+        # Migrate old unsupervised format (4 keys) to unified format (6 keys)
+        if "train" in splits and "train_benign" not in splits:
+            logger.info("Migrating old unsupervised split format to unified format")
+            old_splits = splits
+            splits = {
+                "train_benign": DataSplit(
+                    name="train_benign",
+                    indices=old_splits["train"].indices,
+                    n_samples=old_splits["train"].n_samples,
+                    contains_jailbreaks=False,
+                ),
+                "train_jailbreak": DataSplit(
+                    name="train_jailbreak",
+                    indices=np.array([], dtype=np.int64),
+                    n_samples=0,
+                    contains_jailbreaks=True,
+                ),
+                "val_benign": DataSplit(
+                    name="val_benign",
+                    indices=old_splits["val"].indices,
+                    n_samples=old_splits["val"].n_samples,
+                    contains_jailbreaks=False,
+                ),
+                "val_jailbreak": DataSplit(
+                    name="val_jailbreak",
+                    indices=np.array([], dtype=np.int64),
+                    n_samples=0,
+                    contains_jailbreaks=True,
+                ),
+                "test_benign": DataSplit(
+                    name="test_benign",
+                    indices=old_splits["test_benign"].indices,
+                    n_samples=old_splits["test_benign"].n_samples,
+                    contains_jailbreaks=False,
+                ),
+                "test_jailbreak": DataSplit(
+                    name="test_jailbreak",
+                    indices=old_splits["test_jailbreak"].indices,
+                    n_samples=old_splits["test_jailbreak"].n_samples,
+                    contains_jailbreaks=True,
+                ),
+            }
+
         logger.info("Loaded split definitions from %s", path)
         return splits
 
@@ -541,7 +554,7 @@ class SplitManager:
     def load_mode(cls, path: Path | str) -> SplitMode:
         """Load the SplitMode from a saved splits JSON file.
 
-        Returns SplitMode.UNSUPERVISED for files saved before mode was added.
+        Returns SplitMode.UNSUPERVISED for legacy files without a mode field.
 
         Args:
             path: Path to the JSON file saved by save_splits.

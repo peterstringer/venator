@@ -16,7 +16,7 @@ from venator.dashboard.components.charts import (
     labeled_data_efficiency_chart,
 )
 from venator.dashboard.state import PipelineState
-from venator.data.splits import SplitManager, SplitMode
+from venator.data.splits import SplitManager
 from venator.detection.autoencoder import AutoencoderDetector
 from venator.detection.ensemble import (
     DetectorEnsemble,
@@ -79,12 +79,8 @@ def _get_train_val(
     layer: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get benign-only train and val data for a layer."""
-    if "train" in splits:
-        X_train = store.get_activations(layer, indices=splits["train"].indices.tolist())
-        X_val = store.get_activations(layer, indices=splits["val"].indices.tolist())
-    else:
-        X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
-        X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
+    X_train = store.get_activations(layer, indices=splits["train_benign"].indices.tolist())
+    X_val = store.get_activations(layer, indices=splits["val_benign"].indices.tolist())
     return X_train, X_val
 
 
@@ -249,9 +245,8 @@ st.subheader("Configuration")
 
 store = ActivationStore(state.store_path)
 splits = SplitManager.load_splits(state.splits_path)
-split_mode = SplitManager.load_mode(state.splits_path)
-is_semi = split_mode == SplitMode.SEMI_SUPERVISED
 available_layers = store.layers
+has_labeled_jailbreaks = splits["train_jailbreak"].n_samples > 0
 
 abl_col1, abl_col2 = st.columns(2)
 with abl_col1:
@@ -260,9 +255,9 @@ with abl_col2:
     # placeholder for alignment
     pass
 
-# Semi-supervised ablation options
-if is_semi:
-    st.markdown("**Supervised ablations** (requires semi-supervised splits):")
+# Supervised ablation options (available when labeled jailbreaks exist)
+if has_labeled_jailbreaks:
+    st.markdown("**Supervised ablations** (labeled jailbreaks available):")
     ss_col1, ss_col2 = st.columns(2)
     with ss_col1:
         run_label_efficiency = st.checkbox("Labeled data efficiency", value=True)
@@ -274,6 +269,7 @@ if is_semi:
 else:
     run_label_efficiency = False
     run_cross_source = False
+    st.info("Add labeled jailbreaks to training splits to unlock supervised ablations.")
 
 default_layer = available_layers[len(available_layers) // 2]
 base_layer = st.selectbox(
@@ -345,7 +341,7 @@ if st.button("Run Ablations", type="primary"):
         results["layers"] = layer_results
 
     # --- Labeled data efficiency ---
-    if run_label_efficiency and is_semi:
+    if run_label_efficiency and has_labeled_jailbreaks:
         from venator.detection.contrastive import ContrastiveDirectionDetector
         from venator.detection.linear_probe import LinearProbeDetector
 
@@ -419,7 +415,7 @@ if st.button("Run Ablations", type="primary"):
         }
 
     # --- Cross-source generalization ---
-    if run_cross_source and is_semi:
+    if run_cross_source and has_labeled_jailbreaks:
         progress.progress(
             current / total_configs,
             text="Cross-source generalization...",
