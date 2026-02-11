@@ -1,170 +1,121 @@
 # Venator
 
-**Jailbreak detection via a linear probe on LLM hidden state activations — 0.999 AUROC with only 30 labeled training examples.**
+**Jailbreak detection through activation probing.**
 
-Venator trains a logistic regression on Mistral-7B's internal representations to detect jailbreak attempts, consistent with Anthropic's finding that linear probes on activations can match dedicated classifiers at a fraction of the cost ([Cunningham et al. 2025](https://www.anthropic.com)).
+Venator is an automated pipeline for training and optimising detectors that identify jailbreak attempts on language models by reading their hidden activations during inference. Rather than analysing the text of a prompt or trusting the model's output, it looks at what the language model is doing internally. It appears jailbreaks leave a very clear signature.
+
+A linear probe (logistic regression) on middle-layer activations from Mistral-7B achieves **0.999 AUROC** with around 30 labelled jailbreak examples. Even using just five labelled jailbreak examples achieves an AUROC of 0.996.
+
+## How it works
+
+During inference, Venator extracts hidden state activations from the transformer's middle layers — the point where the model has moved past token-level processing and started representing input intent. These 4096-dimensional vectors get reduced to 50 via PCA (you can go as low as 20 without meaningful loss), then scored by the probe. The entire scoring step is a single matrix multiply.
+
+The pipeline runs locally on Apple Silicon via MLX with 4-bit quantised models. No cloud GPUs needed.
 
 ## Results
 
-Primary detector: Linear probe on Mistral-7B layer 16 activations (50 PCA dims)
+**Model:** Mistral-7B-Instruct-v0.3 (4-bit quantised via MLX) | **Layer:** 18 | **PCA:** 50 dims | **Test set:** 150 benign + 350 jailbreak prompts (held-out)
 
-| Metric | Value |
-|--------|-------|
+| Metric | Linear Probe |
+|--------|-------------|
 | AUROC | 0.999 |
 | AUPRC | 1.000 |
-| Recall @ threshold | 0.99 |
-| FPR @ threshold | 0.03 |
-| Training jailbreaks needed | 30 |
+| F1 | 0.991 |
+| Precision | 0.997 |
+| Recall | 0.986 |
+| FPR | 0.007 |
 
-A logistic regression probe achieves near-perfect jailbreak detection using the representations the LLM already computes. The ensemble of all detectors (0.932 AUROC) performs *worse* than the linear probe alone — ensembling adds noise when one component dominates.
+The best unsupervised method (autoencoder) reached 0.869 AUROC. The supervised probe with just 5 labelled examples already sits at 0.996.
 
-## Core Idea
+### Full detector comparison
 
-> Jailbreak attempts produce statistically distinguishable activation patterns in LLM hidden states — a logistic regression on middle-layer activations is sufficient to detect them.
+| Detector | Type | AUROC | F1 |
+|----------|------|-------|-----|
+| **Linear Probe** | **Supervised** | **0.999** | **0.991** |
+| MLP Probe | Supervised | 0.997 | 0.990 |
+| Contrastive Mahalanobis | Supervised | 0.995 | 0.975 |
+| Custom Ensemble | Ensemble | 0.967 | 0.970 |
+| Autoencoder | Unsupervised | 0.869 | 0.878 |
+| PCA + Mahalanobis | Unsupervised | 0.737 | 0.823 |
+| Isolation Forest | Unsupervised | 0.711 | 0.787 |
+| Contrastive Direction | Supervised | 0.656 | 0.880 |
 
-This builds on findings from the ELK literature (Mallen et al. 2024, Burns et al. 2022) and Anthropic's safety research:
+<details>
+<summary>Score distributions and ROC curves</summary>
 
-- Linear probes on middle-layer activations detect behavioral anomalies with 0.94+ AUROC
-- Middle layers generalize best ("Earliest Informative Layer" criterion)
-- Linear probes on activations match larger dedicated classifiers (Cunningham et al. 2025)
+**Linear probe score distribution** — benign prompts cluster near 0, jailbreaks near 1, with clean separation at the 0.550 threshold:
 
-**Why this matters for AI safety:** Jailbreaks bypass safety training in unpredictable ways — we can't enumerate all attacks. A linear probe needs only ~30 labeled jailbreaks and reuses representations the LLM already computes. Probing internal activations captures *how the model computes*, not just *what it outputs*.
+![Linear Probe Scores](venator/results/linearprobescores.png)
 
-## Architecture
+**ROC curve comparison** — all 8 detectors overlaid:
 
-```
-                        ┌─────────────────────────────────────────┐
-                        │           Venator Pipeline               │
-                        └─────────────────────────────────────────┘
-                                         │
-         ┌───────────────┬───────────────┼───────────────┬────────────────┐
-         ▼               ▼               ▼               ▼                ▼
-   ┌───────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐  ┌────────────┐
-   │  Collect   │  │  Extract   │  │   Split    │  │   Train   │  │  Evaluate  │
-   │  Prompts   │  │ Activations│  │  Data      │  │ Detectors │  │  & Detect  │
-   └─────┬─────┘  └─────┬──────┘  └─────┬──────┘  └─────┬─────┘  └─────┬──────┘
-         │               │               │               │              │
-         ▼               ▼               ▼               ▼              ▼
-   ┌───────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐  ┌────────────┐
-   │  Benign   │  │   MLX +    │  │  Train:    │  │  Linear   │  │  AUROC,    │
-   │  + Jail-  │  │ Mistral-7B │  │  benign +  │  │  Probe    │  │  PR curves │
-   │  break    │  │ Hidden     │  │  ~30 jail- │  │ (primary) │  │  Prompt    │
-   │  JSONL    │  │ States     │  │  breaks    │  │  + compar-│  │  Explorer  │
-   │           │  │ → HDF5     │  │  Test:     │  │  ison     │  │  Figures   │
-   │           │  │            │  │  held-out  │  │  baselines│  │            │
-   └───────────┘  └────────────┘  └────────────┘  └───────────┘  └────────────┘
-```
+![ROC Curve Comparison](venator/results/ROC%20curve%20comparison.png)
 
-```
-venator/
-├── venator/
-│   ├── config.py                 # Pydantic-settings configuration
-│   ├── pipeline.py               # End-to-end orchestration
-│   ├── activation/
-│   │   ├── extractor.py          # MLX-based hidden state extraction
-│   │   └── storage.py            # HDF5 activation storage
-│   ├── data/
-│   │   ├── prompts.py            # Prompt dataset management
-│   │   └── splits.py             # Train/val/test splitting
-│   ├── detection/
-│   │   ├── base.py               # AnomalyDetector ABC
-│   │   ├── linear_probe.py       # PRIMARY: logistic regression on activations
-│   │   ├── contrastive.py        # Comparison: diff-in-means + class-conditional Mahalanobis
-│   │   ├── pca_mahalanobis.py    # Comparison: unsupervised baseline
-│   │   ├── isolation_forest.py   # Comparison: unsupervised baseline
-│   │   ├── autoencoder.py        # Comparison: unsupervised baseline
-│   │   ├── ensemble.py           # Training harness + comparison infrastructure
-│   │   └── metrics.py            # AUROC, precision, recall, curves
-│   └── dashboard/                # Streamlit 5-page pipeline UI
-│       ├── app.py                # Main entry point + navigation
-│       ├── state.py              # Session state management
-│       ├── pages/                # Pipeline, Results, Explore, Detect, Ablations
-│       └── components/           # Reusable charts, tables
-├── scripts/                      # CLI entry points
-│   ├── evaluate_final.py         # Definitive eval: JSON + figures + summary
-│   └── ...                       # collect, extract, split, train, ablations
-├── examples/
-│   └── quickstart.py             # Minimal detection example
-├── docs/                         # Methodology and results write-up
-├── data/                         # Prompts and activation HDF5 files
-├── models/                       # Saved detector models
-└── tests/                        # 458 pytest tests
-```
+**Precision-recall curve** (linear probe):
 
-## Setup
+![Precision-Recall Curve](venator/results/precision-recallcurve.png)
+
+</details>
+
+## What I found interesting
+
+**The jailbreak boundary is linear.** An MLP probe with considerably more capacity scored 0.997 — no improvement over logistic regression. The separation in activation space is a straight line.
+
+**The signal appears early.** Layer 4 out of 32 gives 0.981 AUROC. By layer 10 it's at 0.998+. The model recognises jailbreak intent almost immediately.
+
+**It generalises across attack types.** Training on one jailbreak category and testing on entirely different ones (DAN-style, encoding-based, etc.): 0.996–0.999 AUROC. There seems to be an identifiable "jailbreak direction" in activation space that's consistent regardless of technique.
+
+**Ensembling hurt.** Combining all detectors dropped performance from 0.999 to 0.967. The weaker methods just added noise.
+
+**Remarkably few labels needed.** The performance curve from 5 to 30 labelled jailbreaks is nearly flat — the jailbreak direction is identified by the very first few examples. Returns plateau sharply after 30–50 labels.
+
+| Labelled Jailbreaks | Linear Probe AUROC |
+|---------------------|-------------------|
+| 5 | 0.996 |
+| 10 | 0.996 |
+| 20 | 0.997 |
+| 30 | 0.998 |
+| 50 | 0.999 |
+
+## Background
+
+This project was influenced by Anthropic's research direction on applying anomaly detection to model latent activations to flag out-of-distribution inputs like jailbreaks. The approach builds on the Cheap Monitors paper (Cunningham et al., 2025), which showed that reusing a model's own intermediate representations for safety classification can match dedicated classifiers at a fraction of the cost.
+
+It started as a purely unsupervised system, to see if labelled data could be eschewed. But adding even a handful of labelled examples made the unsupervised approach redundant, so the focus shifted to understanding how few labels you actually need and how well the probe generalises.
+
+Full write-ups: [Methodology](docs/METHODOLOGY.md) | [Results](docs/RESULTS.md)
+
+## Getting started
 
 **Requirements:** Python 3.11+, Apple Silicon Mac (for MLX acceleration)
 
 ```bash
-# Clone and install
-git clone <repo-url> && cd venator
+git clone https://github.com/peterstringer/venator.git && cd venator
 pip install -e ".[dev,dashboard]"
 ```
 
-**Dependencies:**
-
-| Layer | Technology | Rationale |
-|-------|-----------|-----------|
-| LLM Inference | MLX + mlx-lm | Optimized for Apple Silicon, native Metal acceleration |
-| Model | Mistral-7B-Instruct-v0.3 (4-bit) | Fits M4 Pro memory, instruction-tuned |
-| Numerical | NumPy, SciPy, scikit-learn | Standard scientific Python stack |
-| Deep Learning | PyTorch (CPU) | Autoencoder detector only |
-| Storage | HDF5 (h5py) | Efficient activation matrix storage |
-| Dashboard | Streamlit + Plotly | Interactive pipeline UI |
-| Figures | Matplotlib | Publication-ready static figures |
-| Config | Pydantic Settings | Type-safe, environment variable overrides |
-
-## Quickstart
-
-### Option 1: Streamlit Dashboard (recommended)
+### Dashboard (recommended)
 
 ```bash
 streamlit run venator/dashboard/app.py
 ```
 
-The dashboard guides you through a 5-page workflow:
+The **Quick Run** page (default landing) automates the full pipeline: data collection, activation extraction, splitting, auto-optimisation across layers/PCA/detectors, and final evaluation. Other pages provide manual pipeline control, results exploration, prompt-level analysis, live detection, and ablation studies.
 
-1. **Pipeline** — Collect data, extract activations, create splits, train detectors
-2. **Results** — Headline metrics, ROC curves, score distributions, detector comparison
-3. **Explore** — Prompt-level deep dive, FP/FN error analysis
-4. **Live Detection** — Single-prompt jailbreak detection with the primary detector
-5. **Ablations** — Layer comparison, label efficiency, cross-source generalization
-
-### Option 2: Python API
+### Python API
 
 ```python
 from venator.pipeline import VenatorPipeline
 
-# Load a trained pipeline and detect jailbreaks
 pipeline = VenatorPipeline.load("models/v2/")
 result = pipeline.detect("What causes the seasons to change?")
 print(f"Score: {result['score']:.4f}, Jailbreak: {result['is_jailbreak']}")
 ```
 
-See [examples/quickstart.py](examples/quickstart.py) for a complete example with multiple prompts.
-
-### Option 3: CLI Scripts
-
-```bash
-# Train detector (requires extracted activations + splits)
-python scripts/train_detector.py \
-    --store data/activations/all.h5 \
-    --splits data/splits_semi.json \
-    --ensemble-type hybrid \
-    --layer 16 \
-    --output models/v2/
-
-# Evaluate and generate publication figures
-python scripts/evaluate_final.py \
-    --model-dir models/v2/ \
-    --store data/activations/all.h5 \
-    --splits data/splits_semi.json \
-    --output results/final/ \
-    --figures results/figures/
-```
+### CLI
 
 <details>
-<summary>Full CLI pipeline (all steps)</summary>
+<summary>Full CLI pipeline</summary>
 
 ```bash
 # 1. Collect prompts
@@ -175,114 +126,57 @@ python scripts/extract_activations.py \
     --prompts data/prompts/benign.jsonl \
     --output data/activations/all.h5 \
     --model mlx-community/Mistral-7B-Instruct-v0.3-4bit \
-    --layers 12 14 16 18 20
+    --layers 4 6 8 10 12 14 16 18 20 22 24
 
-# 3. Create splits (semi-supervised: small jailbreak set in train/val)
+# 3. Create splits
 python scripts/create_splits.py \
     --store data/activations/all.h5 \
-    --output data/splits_semi.json \
-    --split-mode semi_supervised
+    --output data/splits.json
 
 # 4. Train
 python scripts/train_detector.py \
     --store data/activations/all.h5 \
-    --splits data/splits_semi.json \
+    --splits data/splits.json \
     --ensemble-type hybrid \
-    --layer 16 \
+    --layer 18 \
     --output models/v2/
 
 # 5. Evaluate
 python scripts/evaluate_final.py \
     --model-dir models/v2/ \
     --store data/activations/all.h5 \
-    --splits data/splits_semi.json \
-    --output results/final/ \
-    --figures results/figures/
+    --splits data/splits.json \
+    --output results/final/
 
-# 6. Run ablation studies
+# 6. Ablation studies
 python scripts/run_supervised_ablations.py \
     --store data/activations/all.h5 \
-    --splits data/splits_semi.json \
+    --splits data/splits.json \
     --ablate label_budget generalization \
     --output results/supervised_ablations/
 ```
 
 </details>
 
-## Detection Architecture
+## Tech
 
-The **linear probe** is the primary (production) detector. Other detectors exist for research comparison:
-
-| Detector | Type | Role | AUROC |
-|----------|------|------|-------|
-| Linear Probe | Supervised | **Primary** | 0.999 |
-| Contrastive Mahalanobis | Supervised | Comparison | 0.996 |
-| Autoencoder | Unsupervised | Comparison (best unsupervised) | ~0.9 |
-| PCA + Mahalanobis | Unsupervised | Comparison | ~0.9 |
-| Isolation Forest | Unsupervised | Comparison | ~0.85 |
-| Contrastive Direction | Supervised | Comparison | 0.656 |
-| Ensemble (weighted avg) | Ensemble | Retired | 0.932 |
-
-**Why no ensemble?** Ensembles help when component errors are decorrelated AND components are comparably accurate. When one component (the linear probe) is far stronger, ensembling adds noise. The linear probe at 0.999 AUROC is dragged down to 0.932 by including weaker detectors.
-
-## Methodology
-
-Semi-supervised with strict test set isolation — see [docs/METHODOLOGY.md](docs/METHODOLOGY.md) for the full write-up.
-
-**Key principles:**
-
-- **Train**: Benign prompts + ~30 labeled jailbreaks (semi-supervised)
-- **Validation**: Benign + small jailbreak set — threshold via Youden's J statistic
-- **Test**: Held-out benign + 70% of jailbreaks (never seen in training)
-- **Primary metric**: AUROC (threshold-independent, standard for anomaly detection)
-
-**Critical constraints:**
-1. Majority of jailbreaks reserved for testing (70%+ never seen in training)
-2. No threshold selection on test data
-3. Healthy sample-to-feature ratio (PCA to 50 dims from 4096)
-4. Primary detector only for production inference
-5. Report AUROC as primary metric
-
-## Configuration
-
-All settings can be overridden via environment variables (prefix: `VENATOR_`):
-
-| Setting | Default | Env Var |
-|---------|---------|---------|
-| Model | Mistral-7B-Instruct-v0.3 (4-bit) | `VENATOR_MODEL_ID` |
-| Extraction layers | [12, 14, 16, 18, 20] | `VENATOR_EXTRACTION_LAYERS` |
-| PCA dimensions | 50 | `VENATOR_PCA_DIMS` |
-| Threshold percentile | 95.0 | `VENATOR_ANOMALY_THRESHOLD_PERCENTILE` |
-| Random seed | 42 | `VENATOR_RANDOM_SEED` |
-
-## Testing
-
-```bash
-# Run all tests (458 tests)
-pytest tests/ -v
-
-# With coverage
-pytest tests/ --cov=venator
-
-# Specific module
-pytest tests/test_detectors.py -v
-```
-
-Test suite covers:
-- Unit tests for each detector (including supervised types) on synthetic data
-- Integration tests for the full pipeline with mock activations
-- Methodology tests verifying no data leakage
-- Roundtrip tests for save/load of all detectors
-- Threshold calibration tests (Youden's J, F1, FPR target, percentile)
+| Component | Technology |
+|-----------|-----------|
+| LLM inference | MLX + mlx-lm (Apple Silicon, Metal acceleration) |
+| Model | Mistral-7B-Instruct-v0.3, 4-bit quantised |
+| ML | scikit-learn (PCA, logistic regression), PyTorch (MLP probe, autoencoder) |
+| Storage | HDF5 via h5py |
+| Dashboard | Streamlit + Plotly |
+| Config | Pydantic Settings (`VENATOR_` env prefix) |
 
 ## References
 
-- Mallen et al., ["Eliciting Latent Knowledge from Quirky Language Models"](https://arxiv.org/abs/2312.01037) (2024) — ELK paper; middle-layer probing
-- Burns et al., ["Discovering Latent Knowledge Without Supervision"](https://arxiv.org/abs/2212.03827) (2022) — CCS; unsupervised truth discovery from activations
 - Cunningham et al., "Cost-Effective Constitutional Classifiers via Representation Re-use" (Anthropic, 2025) — Linear probes as cheap monitors
-- Sharma et al., ["Constitutional Classifiers: Defending against Universal Jailbreak Attacks on LLMs"](https://arxiv.org/abs/2501.18837) (2025) — Constitutional classifiers
-- Chao et al., ["JailbreakBench: An Open Robustness Benchmark for Jailbreaking LLMs"](https://arxiv.org/abs/2404.01318) (2024) — Jailbreak dataset and evaluation framework
+- Mallen et al., ["Eliciting Latent Knowledge from Quirky Language Models"](https://arxiv.org/abs/2312.01037) (2024) — Middle-layer probing for ELK
+- Burns et al., ["Discovering Latent Knowledge Without Supervision"](https://arxiv.org/abs/2212.03827) (2022) — Unsupervised truth discovery from activations
+- Sharma et al., ["Constitutional Classifiers"](https://arxiv.org/abs/2501.18837) (2025) — Defending against universal jailbreak attacks
+- Chao et al., ["JailbreakBench"](https://arxiv.org/abs/2404.01318) (2024) — Jailbreak dataset and evaluation framework
 
-## License
+## Licence
 
 MIT
