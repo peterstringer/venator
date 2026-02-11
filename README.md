@@ -10,7 +10,7 @@ A linear probe (logistic regression) on middle-layer activations from Mistral-7B
 
 During inference, Venator extracts hidden state activations from the transformer's middle layers — the point where the model has moved past token-level processing and started representing input intent. These 4096-dimensional vectors get reduced to 50 via PCA (you can go as low as 20 without meaningful loss), then scored by the probe. The entire scoring step is a single matrix multiply.
 
-The pipeline runs locally on Apple Silicon via MLX with 4-bit quantised models. No cloud GPUs needed.
+The pipeline runs locally on Apple Silicon via MLX with 4-bit quantised models. No cloud GPUs needed. Though one of the next questions to be answered is whether the smaller models can be used to flag jailbreaks for larger models.
 
 ## Results
 
@@ -59,15 +59,17 @@ The best unsupervised method (autoencoder) reached 0.869 AUROC. The supervised p
 
 ## What I found interesting
 
-**The jailbreak boundary is linear.** An MLP probe with considerably more capacity scored 0.997 — no improvement over logistic regression. The separation in activation space is a straight line.
+**The jailbreak boundary is linear.** A Multi-Layer Perceptron (MLP) probe with considerably more capacity scored 0.997 — no improvement over logistic regression. The separation in activation space is a straight line.
 
 **The signal appears early.** Layer 4 out of 32 gives 0.981 AUROC. By layer 10 it's at 0.998+. The model recognises jailbreak intent almost immediately.
 
-**It generalises across attack types.** Training on one jailbreak category and testing on entirely different ones (DAN-style, encoding-based, etc.): 0.996–0.999 AUROC. There seems to be an identifiable "jailbreak direction" in activation space that's consistent regardless of technique.
+**It generalises across attack types.** Training on one jailbreak category and testing on entirely different ones (i.e. DAN-style or Encoding jailbreaks): 0.996–0.999 AUROC. There seems to be a indentifiable "jailbreak direction" in activation space that's consistent regardless of technique.
 
-**Ensembling hurt.** Combining all detectors dropped performance from 0.999 to 0.967. The weaker methods just added noise.
+**Ensembling reduced performance.** Combining all detectors dropped performance from 0.999 to 0.967. The weaker methods just added noise in the cases I tested.
 
-**Remarkably few labels needed.** The performance curve from 5 to 30 labelled jailbreaks is nearly flat — the jailbreak direction is identified by the very first few examples. Returns plateau sharply after 30–50 labels.
+**Jailbreak signal has low dimensionality.** The probe is remarkably insensitive to how aggressively you compress the activations. Raw 4096-dimensional activations score 0.9995 AUROC. PCA down to 50 dimensions: 0.9995. Down to 20: 0.9991. Even 10 dimensions still gives 0.996. The jailbreak signal is low-dimensional — most of those 4096 features are noise as far as detection is concerned.
+
+**Labelled training data is very efficient.** Five labelled jailbreaks give 0.994 AUROC. Thirty gets you to 0.997. Seventy-five reaches 0.9995. For comparison, the best unsupervised methods without any labels top out at 0.812 (autoencoder) and 0.695 (PCA + Mahalanobis). The curve is nearly flat from 5 to 30 labels — the probe identifies the jailbreak direction from the first few examples and additional labels offer diminishing returns.
 
 | Labelled Jailbreaks | Linear Probe AUROC |
 |---------------------|-------------------|
