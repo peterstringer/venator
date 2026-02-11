@@ -2,67 +2,58 @@
 
 Launch with: streamlit run venator/dashboard/app.py
 
-Provides a 6-page dashboard UI with status-embedded navigation.
-Quick Run is listed first as a standalone workflow; the remaining 5 pages
-form the detailed pipeline. Navigation items show completion status:
-  ✅ = stage complete
-  →  = available (prerequisites met, not yet done)
-  🔒 = locked (prerequisites not met)
+6-page dashboard grouped into three sections. Quick Run is the default
+landing page. Pages that require prerequisites show a message when
+clicked before their dependencies are complete.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
-from venator.dashboard.components.pipeline_status import render_sidebar_header
+from venator.dashboard.components.pipeline_status import render_sidebar
 from venator.dashboard.state import PipelineState
 
-# Must be the first Streamlit call
-st.set_page_config(page_title="Venator", page_icon="\U0001f3af", layout="wide")
+st.set_page_config(page_title="Venator", layout="wide")
 
-# Initialize pipeline state (auto-detects existing artifacts on first load)
 state = PipelineState()
 
+# Inject title above navigation via CSS pseudo-elements on the sidebar header.
+# st.sidebar content always renders BELOW st.navigation(), so we target the
+# header container ([data-testid="stSidebarHeader"]) which sits above the nav.
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Offside&display=swap');
 
-def _status_icon(page_key: str) -> str:
-    """Get status icon for a page based on pipeline state."""
-    # Completion: has this page's work been done?
-    completion: dict[str, bool] = {
-        "pipeline": state.model_ready,
-        "results": state.evaluation_ready,
-        "explore": state.evaluation_ready,
-        "detect": state.model_ready,
-        "ablations": False,  # No tracked completion state
+    [data-testid="stSidebarHeader"]::before {
+        content: "Venator";
+        font-family: 'Offside', cursive;
+        font-size: 1.8rem;
+        display: block;
+        padding: 0.5rem 1rem 0;
     }
-    # Availability: are prerequisites met?
-    stage_num = {"pipeline": 1, "results": 2, "explore": 3, "detect": 4, "ablations": 5}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    if completion.get(page_key, False):
-        return "\u2705"
-    elif state.is_stage_available(stage_num[page_key]):
-        return "\u2192"
-    else:
-        return "\U0001f512"
-
-
-# Build pages with dynamic status titles
-# Quick Run is a standalone workflow, listed separately before the detailed pages
+# Page groups separated by dividers (empty keys = no visible header)
 pages = {
     "": [
-        st.Page("pages/quick_run.py", title="\u26a1 Quick Run", url_path="quick-run", default=True),
+        st.Page("pages/quick_run.py", title="Quick Run", url_path="quick-run", default=True),
     ],
     "Pipeline": [
-        st.Page("pages/1_pipeline.py", title=f"{_status_icon('pipeline')} Pipeline", url_path="pipeline"),
-        st.Page("pages/2_results.py", title=f"{_status_icon('results')} Results", url_path="results"),
-        st.Page("pages/3_explore.py", title=f"{_status_icon('explore')} Explore", url_path="explore"),
-        st.Page("pages/4_detect.py", title=f"{_status_icon('detect')} Live Detection", url_path="detect"),
-        st.Page("pages/5_ablations.py", title=f"{_status_icon('ablations')} Ablations", url_path="ablations"),
+        st.Page("pages/1_pipeline.py", title="Run Pipeline", url_path="pipeline"),
+        st.Page("pages/2_results.py", title="Results", url_path="results"),
+        st.Page("pages/5_ablations.py", title="Ablations", url_path="ablations"),
+    ],
+    "Prompts": [
+        st.Page("pages/3_explore.py", title="Explore Prompts", url_path="explore"),
+        st.Page("pages/4_detect.py", title="Test Prompts", url_path="detect"),
     ],
 }
 
 pg = st.navigation(pages)
-
-# Render minimal sidebar (header + stats only — no duplicate page list)
-render_sidebar_header(state)
-
+render_sidebar(state)
 pg.run()

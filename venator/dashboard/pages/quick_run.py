@@ -217,7 +217,7 @@ if st.session_state.get("_quick_run_complete"):
         if st.button("View Full Results", key="qr_results"):
             st.switch_page("pages/2_results.py")
     with btn3:
-        if st.button("Run Again", key="qr_rerun"):
+        if st.button("Start Again", key="qr_rerun"):
             st.session_state["_quick_run_complete"] = False
             if "_quick_run_results" in st.session_state:
                 del st.session_state["_quick_run_results"]
