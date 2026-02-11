@@ -181,4 +181,4 @@ python scripts/run_supervised_ablations.py \
 
 ## Licence
 
-MIT
+PolyForm Noncommercial License 1.0.0
